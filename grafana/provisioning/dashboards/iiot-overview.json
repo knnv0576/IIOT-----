@@ -1,0 +1,249 @@
+{
+  "id": null,
+  "uid": "iiot-overview",
+  "title": "IIoT 全系統視覺化戰情室",
+  "tags": ["iiot"],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-5m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "custom",
+        "label": "機台",
+        "query": "SCT-01,SCT-02,SCT-03,SCT-04,SCT-05,SCT-06,SCT-07,SCT-08,SCT-09,SCT-10",
+        "current": { "text": "SCT-01", "value": "SCT-01" },
+        "options": [
+          { "text": "SCT-01", "value": "SCT-01", "selected": true },
+          { "text": "SCT-02", "value": "SCT-02" },
+          { "text": "SCT-03", "value": "SCT-03" },
+          { "text": "SCT-04", "value": "SCT-04" },
+          { "text": "SCT-05", "value": "SCT-05" },
+          { "text": "SCT-06", "value": "SCT-06" },
+          { "text": "SCT-07", "value": "SCT-07" },
+          { "text": "SCT-08", "value": "SCT-08" },
+          { "text": "SCT-09", "value": "SCT-09" },
+          { "text": "SCT-10", "value": "SCT-10" }
+        ]
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "機台狀態即時圖表（$device）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "溫度 — $device",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "celsius", "custom": { "drawStyle": "line", "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS \"time\", value AS \"溫度\"\nFROM sensor_readings\nWHERE device_id = '$device'\n  AND sensor_id = 'T' || (split_part('$device','-',2))::int::text\n  AND $__timeFilter(ts)\nORDER BY ts",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "電流三相 (A/B/C) — $device",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS \"time\", sensor_id AS \"metric\", value\nFROM sensor_readings\nWHERE device_id = '$device'\n  AND sensor_id LIKE 'E%'\n  AND $__timeFilter(ts)\nORDER BY ts",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "三軸合成振動 vs ISO 門檻 — $device",
+      "description": "綠=優良上限、黃=可接受上限、紅=危險門檻（依機台 Class 自動對應）",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "velocitymms", "custom": { "drawStyle": "line", "spanNulls": true } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "優良上限" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "可接受上限" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "危險門檻" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "合成振動" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } },
+              { "id": "custom.lineWidth", "value": 2 }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT\n  g.ts AS \"time\",\n  sqrt(g.x*g.x + g.y*g.y + g.z*g.z) AS \"合成振動\",\n  t.good_upper AS \"優良上限\",\n  t.acceptable_upper AS \"可接受上限\",\n  t.danger_lower AS \"危險門檻\"\nFROM (\n  SELECT ts,\n         max(value) FILTER (WHERE sensor_id LIKE '%-X') AS x,\n         max(value) FILTER (WHERE sensor_id LIKE '%-Y') AS y,\n         max(value) FILTER (WHERE sensor_id LIKE '%-Z') AS z\n  FROM sensor_readings\n  WHERE device_id = '$device' AND sensor_id LIKE 'V%' AND $__timeFilter(ts)\n  GROUP BY ts\n) g\nCROSS JOIN (\n  SELECT good_upper, acceptable_upper, danger_lower\n  FROM machine_vibration_thresholds WHERE device_id = '$device'\n) t\nORDER BY g.ts",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "AI 即時警報（$device，門檻規則版，待接 Phase3 AI 推論）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "即時異常警報 — $device",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 10 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "special", "options": { "match": "null+nan", "result": { "text": "NORMAL", "color": "green" } } },
+            { "type": "value", "options": { "0": { "text": "✅ NORMAL", "color": "green" } } },
+            { "type": "regex", "options": { "pattern": "CRITICAL.*", "result": { "color": "red" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT\n  CASE WHEN COALESCE(max(sqrt(g.x*g.x + g.y*g.y + g.z*g.z)), 0) > max(t.danger_lower)\n       THEN 'CRITICAL: $device Vibration Exceeded Limit!'\n       ELSE 'NORMAL' END AS \"狀態\"\nFROM (\n  SELECT ts,\n         max(value) FILTER (WHERE sensor_id LIKE '%-X') AS x,\n         max(value) FILTER (WHERE sensor_id LIKE '%-Y') AS y,\n         max(value) FILTER (WHERE sensor_id LIKE '%-Z') AS z\n  FROM sensor_readings\n  WHERE device_id = '$device' AND sensor_id LIKE 'V%' AND ts > now() - INTERVAL '10 seconds'\n  GROUP BY ts\n) g\nCROSS JOIN (\n  SELECT danger_lower FROM machine_vibration_thresholds WHERE device_id = '$device'\n) t",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "系統健康監控（edge_pipeline 進程）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "CPU 使用率",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS \"time\", cpu_percent AS \"CPU%\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "記憶體使用量",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS \"time\", memory_mb AS \"RAM(MB)\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "每秒寫入吞吐量 (TPS)",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS \"time\", tps AS \"TPS\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "資料庫寫入延遲",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT ts AS \"time\", write_latency_ms AS \"延遲(ms)\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts",
+          "rawQuery": true
+        }
+      ]
+    }
+  ]
+}

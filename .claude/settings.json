@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose *)",
+      "Bash(NUM_DB_WRITERS=4 docker compose up -d edge_pipeline)",
+      "Bash(curl -s -u admin:admin http://localhost:3000/api/search?query=IIoT)",
+      "Bash(docker compose exec -T edge_pipeline python -c ' *)",
+      "Bash(curl -s -u admin:admin http://localhost:3000/api/dashboards/uid/iiot-overview)",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s -u admin:admin -X POST http://localhost:3000/api/ds/query -H 'Content-Type: application/json' -d '{ *)",
+      "Bash(docker wait *)",
+      "Bash(gh auth *)",
+      "Bash(find . -maxdepth 2 -iname \".env\" -o -iname \"*.pem\" -o -iname \"*secret*\")",
+      "Bash(where gh *)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}

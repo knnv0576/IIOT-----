@@ -1,0 +1,81 @@
+name: iiot
+
+services:
+  # Phase 1 + Phase 2：機台模擬（10 個 multiprocessing.Process）與 TimescaleDB 寫入
+  # 這兩個 Phase 放在同一個容器/同一個 Python 進程樹裡，
+  # 因為 Phase1 用 multiprocessing.Queue 做跨進程傳輸，
+  # multiprocessing.Queue 只能在同一台機器、同一個父進程底下的子進程之間使用，
+  # 無法跨 Docker 容器直接共用，所以不能把 Phase1 產生端和 Phase2 消費端拆成兩個容器。
+  edge_pipeline:
+    build:
+      context: ./edge_pipeline
+    container_name: iiot-edge-pipeline
+    depends_on:
+      - timescaledb
+      - mosquitto
+    environment:
+      TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:-iiot_password}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+      MQTT_TOPIC_PREFIX: iiot
+      NUM_DB_WRITERS: ${NUM_DB_WRITERS:-4}
+    stdin_open: true  # 保持 stdin 開啟，讓 control_loop 在 -d（背景）模式下不會因為 stdin 立刻 EOF 而馬上結束
+    restart: unless-stopped
+
+  # 外部 IoT 資料進線用的 MQTT broker（之後真實裝置或其他協定轉接器都可以往這裡發布）
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: iiot-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+  # Phase 2 儲存層：PostgreSQL + TimescaleDB 擴充套件
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: iiot-timescaledb
+    environment:
+      POSTGRES_USER: ${TIMESCALEDB_USER:-iiot}
+      POSTGRES_PASSWORD: ${TIMESCALEDB_PASSWORD:-iiot_password}
+      POSTGRES_DB: ${TIMESCALEDB_DB:-iiot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+
+  # Phase 3：獨立 AI 推論服務（One-Class SVM / Autoencoder）
+  ai_service:
+    build:
+      context: ./phase3_ai
+    container_name: iiot-ai-service
+    depends_on:
+      - timescaledb
+    environment:
+      TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:-iiot_password}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
+    restart: unless-stopped
+
+  # Phase 4：Grafana 視覺化戰情室
+  grafana:
+    image: grafana/grafana:latest
+    container_name: iiot-grafana
+    depends_on:
+      - timescaledb
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      TIMESCALEDB_USER: ${TIMESCALEDB_USER:-iiot}
+      TIMESCALEDB_PASSWORD: ${TIMESCALEDB_PASSWORD:-iiot_password}
+      TIMESCALEDB_DB: ${TIMESCALEDB_DB:-iiot}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+
+volumes:
+  timescaledb_data:
+  grafana_data:

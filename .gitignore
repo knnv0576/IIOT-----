@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code 個人本機權限設定，不同人/不同機器內容不同，不該共用
+.claude/settings.local.json
+
+# 真正的密碼設定檔（只留 .env.example 當範本）
+.env
+
+.DS_Store
+Thumbs.db
