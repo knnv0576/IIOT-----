@@ -1,4 +1,4 @@
-"""本地雙緩衝區：暫存一批已算好的 NumPy 陣列，滿 1000 tick 或滿 250ms 就整批出貨。"""
+"""本地雙緩衝區：暫存一批已算好的 NumPy 陣列，滿 FLUSH_TICKS tick 或滿 250ms 就整批出貨。"""
 
 
 class LocalDoubleBuffer:

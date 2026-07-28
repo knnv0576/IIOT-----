@@ -1,11 +1,17 @@
-"""單一機台的 multiprocessing.Process 主迴圈：4kHz tick、雙緩衝、危險模式讀取。"""
+"""單一機台的 multiprocessing.Process 主迴圈：SAMPLE_RATE_HZ tick、雙緩衝、危險模式讀取。"""
 
 import time
 
 import numpy as np
 
 import machine_config
-from constants import FLUSH_SECONDS, FLUSH_TICKS, SAMPLE_INTERVAL, TEMP_TICK_INTERVAL
+from constants import (
+    DEGRADATION_RAMP_SECONDS,
+    FLUSH_SECONDS,
+    FLUSH_TICKS,
+    SAMPLE_INTERVAL,
+    TEMP_TICK_INTERVAL,
+)
 from double_buffer import LocalDoubleBuffer
 from formulas import generate_current_batch, generate_temperature_batch, generate_vibration_batch
 
@@ -17,11 +23,16 @@ def run_machine(
     queue,
     danger_flag,
     stop_event,
+    degrade_flag=None,
     max_batches: int | None = None,
     debug_extra_delay_seconds: float = 0.0,
     debug_extra_delay_every_ticks: int = 0,
 ):
-    """Process target。debug_extra_delay_* 僅供自我測試模擬降速使用，正式運作時保持預設值 0。"""
+    """Process target。debug_extra_delay_* 僅供自我測試模擬降速使用，正式運作時保持預設值 0。
+
+    degrade_flag：跨進程共享的 multiprocessing.Value("d")，-1 代表未劣化，否則存的是「劣化起始
+    的 wall time」，由此算出線性成長的 degradation_level（0~1）。None 代表這台不支援劣化注入。
+    """
 
     rng = np.random.default_rng()
     buffer = LocalDoubleBuffer(device_id)
@@ -48,10 +59,19 @@ def run_machine(
         is_danger = bool(danger_flag.value)
         target_magnitude = danger_target_magnitude if is_danger else normal_target_magnitude
 
+        degradation_level = 0.0
+        if degrade_flag is not None:
+            deg_start = degrade_flag.value
+            if deg_start >= 0.0:  # -1 = 未劣化；否則是劣化起始的 wall time
+                degradation_level = min(1.0, (time.time() - deg_start) / DEGRADATION_RAMP_SECONDS)
+
         current_batch = generate_current_batch(
-            t_array, current_cfg["setpoint"], current_cfg["upper"], current_cfg["lower"], rng
+            t_array, current_cfg["setpoint"], current_cfg["upper"], current_cfg["lower"], rng,
+            degradation_level=degradation_level,
         )
-        vibration_batch = generate_vibration_batch(t_array, target_magnitude, rng)
+        vibration_batch = generate_vibration_batch(
+            t_array, target_magnitude, rng, degradation_level=degradation_level
+        )
 
         buffer.load_batch(timestamps, current_batch, vibration_batch)
         last_flush_perf = time.perf_counter()

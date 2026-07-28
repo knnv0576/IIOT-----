@@ -7,7 +7,7 @@ import time
 import numpy as np
 
 import machine_config
-from constants import FLUSH_SECONDS, FLUSH_TICKS, SAMPLE_INTERVAL
+from constants import FLUSH_SECONDS, FLUSH_TICKS, SAMPLE_INTERVAL, SAMPLE_RATE_HZ
 from formulas import vector_magnitude
 from machine_process import run_machine
 from records import explode_batch
@@ -79,7 +79,7 @@ def test_total_count(config, duration=3.0):
         process.join(timeout=2)
 
     total = sum(counts.values())
-    expected = 10 * 4000 * 6 * duration
+    expected = 10 * SAMPLE_RATE_HZ * 6 * duration
     ratio = total / expected
     ok = 0.9 <= ratio <= 1.1
     print(
@@ -123,7 +123,7 @@ def test_continuity(config, duration=2.0):
     ok = current_ok and temp_ok
     print(
         f"[3. 時序連續性測試] {'PASS' if ok else 'FAIL'}："
-        f"4kHz 通道間隔誤差最大值 {np.max(np.abs(diffs - SAMPLE_INTERVAL)):.2e}s，"
+        f"{SAMPLE_RATE_HZ}Hz 通道間隔誤差最大值 {np.max(np.abs(diffs - SAMPLE_INTERVAL)):.2e}s，"
         f"溫度樣本數 {len(temp_timestamps)}（間隔應為 1s）"
     )
     return ok

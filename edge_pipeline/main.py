@@ -5,15 +5,20 @@
 2. 把機台模擬器與 MQTT 進線的資料，統一批次寫入 TimescaleDB（Phase2）。
 3. 定期把自己的 CPU/記憶體/吞吐量寫進資料庫，給 Grafana 儀表板監控用（Phase4）。
 
-同時提供一個簡單的命令列介面，可以手動切換某台機台的危險模式。
+危險模式切換提供兩種介面：
+- 標準輸入的命令列介面（適合 `docker compose run` 前景互動執行）。
+- HTTP API（適合 `docker compose up -d` 背景執行時，用 curl/瀏覽器操作）。
+兩者共用同一份 danger_flags，切換效果一樣，可以同時開著互不干擾。
 """
 
+import json
 import multiprocessing as mp
 import os
 import queue
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
 import psycopg2
@@ -30,6 +35,9 @@ from records import explode_batch_raw
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "mosquitto")  # MQTT broker 的主機名稱
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))  # MQTT broker 的連接埠
 MQTT_TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "iiot")  # 訂閱主題的前綴，實際訂閱 "<prefix>/#"
+
+# --- 危險模式控制 HTTP API 設定 ---
+HTTP_CONTROL_PORT = int(os.environ.get("HTTP_CONTROL_PORT", "8080"))
 
 # --- TimescaleDB 連線與批次寫入設定 ---
 TIMESCALEDB_DSN = os.environ["TIMESCALEDB_DSN"]  # postgresql://user:password@host:port/dbname，必須由外部提供
@@ -95,29 +103,33 @@ def build_workers(config: dict, stop_event):
         config: machine_config.load_config() 回傳的設定字典（機台清單、溫度/電流/振動門檻）。
         stop_event: multiprocessing.Event()，所有機台進程共用同一個，設定後所有進程都會收到停止訊號。
     回傳：
-        (processes, queues, danger_flags) 三個 list/dict：
+        (processes, queues, danger_flags, degrade_flags) 四個 list/dict：
         - processes: 10 個 multiprocessing.Process 物件（尚未 start()）
         - queues: {device_id: 該機台專屬的 multiprocessing.Queue}，機台把資料批次塞進這裡
         - danger_flags: {device_id: multiprocessing.Value}，跨進程共享的危險模式開關（0=正常,1=危險）
+        - degrade_flags: {device_id: multiprocessing.Value}，漸進劣化起始時間（-1=未劣化）
     """
     queues = {}
     danger_flags = {}
+    degrade_flags = {}
     processes = []
     for machine in config["machines"]:
         device_id = machine["device_id"]
         size_class = machine["size_class"]  # 機台大小分級（I/II/III），決定振動 ISO 門檻
         machine_queue = mp.Queue(maxsize=QUEUE_MAXSIZE)  # 這台機台專屬的輸出佇列，容量見 constants.py
         danger_flag = mp.Value("b", 0)  # 'b' = signed char，跨進程共享的布林值（0/1）
+        degrade_flag = mp.Value("d", -1.0)  # 'd' = double，-1=未劣化，否則=劣化起始的 wall time
         process = mp.Process(
             target=run_machine,  # 實際在子進程裡跑的函式，見 machine_process.py
-            args=(device_id, size_class, config, machine_queue, danger_flag, stop_event),
+            args=(device_id, size_class, config, machine_queue, danger_flag, stop_event, degrade_flag),
             name=device_id,  # 讓 process_monitor_loop 印警示訊息時能直接顯示機台編號
             daemon=True,  # 主進程結束時，這些子進程也會被強制結束，不會變成孤兒進程
         )
         queues[device_id] = machine_queue
         danger_flags[device_id] = danger_flag
+        degrade_flags[device_id] = degrade_flag
         processes.append(process)
-    return processes, queues, danger_flags
+    return processes, queues, danger_flags, degrade_flags
 
 
 def db_writer_loop(
@@ -374,27 +386,117 @@ def control_loop(danger_flags: dict, stop_event):
         print(f"{device_id} -> {mode}")
 
 
+def _make_control_request_handler(danger_flags: dict, degrade_flags: dict, stop_event):
+    """建立一個綁定了 danger_flags/degrade_flags/stop_event 的 HTTP handler 類別。
+
+    用 closure 把共享狀態帶進去，是因為 BaseHTTPRequestHandler 的子類別
+    是由 HTTPServer 自己在每次請求時 instantiate，沒辦法直接在建構子塞自訂參數，
+    所以改成用外層函式包一層，讓內層類別透過 closure 拿到需要的共享狀態。
+    """
+
+    class ControlRequestHandler(BaseHTTPRequestHandler):
+        def _send_json(self, status_code: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            # GET /status -> 回傳所有機台的危險模式與漸進劣化狀態
+            if self.path == "/status":
+                self._send_json(200, {
+                    device_id: {
+                        "danger": bool(danger_flags[device_id].value),
+                        "degrading": degrade_flags[device_id].value >= 0.0,
+                    }
+                    for device_id in danger_flags
+                })
+            else:
+                self._send_json(404, {"error": "not found", "hint": "try GET /status"})
+
+        def do_POST(self):
+            # POST /danger/SCT-05  -> 切成危險模式（瞬間拉高振幅）
+            # POST /degrade/SCT-05 -> 觸發漸進劣化（頻譜諧波隨時間成長，供 AI 驗證用）
+            # POST /normal/SCT-05  -> 切回正常（同時解除危險模式與漸進劣化）
+            # POST /quit           -> 結束整個程式（等同下 QUIT 指令）
+            if self.path == "/quit":
+                stop_event.set()
+                self._send_json(200, {"status": "stopping"})
+                return
+
+            parts = self.path.strip("/").split("/")
+            if len(parts) == 2 and parts[0] in ("danger", "normal", "degrade"):
+                device_id = parts[1].upper()
+                if device_id not in danger_flags:
+                    self._send_json(404, {"error": f"未知機台: {device_id}"})
+                    return
+                if parts[0] == "danger":
+                    danger_flags[device_id].value = 1
+                elif parts[0] == "degrade":
+                    degrade_flags[device_id].value = time.time()  # 記下劣化起始時間，開始線性成長
+                else:  # normal：兩種異常都解除
+                    danger_flags[device_id].value = 0
+                    degrade_flags[device_id].value = -1.0
+                self._send_json(200, {device_id: parts[0].upper()})
+            else:
+                self._send_json(404, {"error": "not found", "hint": "try POST /danger|degrade|normal/<device_id>"})
+
+        def log_message(self, format, *args):
+            pass  # 靜音：預設會把每個 request 都印一行到 stdout，量一多會洗掉其他 log
+
+    return ControlRequestHandler
+
+
+def http_control_loop(danger_flags: dict, degrade_flags: dict, stop_event, port: int = HTTP_CONTROL_PORT):
+    """背景 HTTP API：讓 `docker compose up -d`（背景執行、沒有互動式 stdin 可用）
+    也能用 curl/瀏覽器切換異常模式，功能跟 control_loop() 的 stdin 介面等價、共用同一份旗標。
+
+    端點：
+        GET  /status               回傳所有機台的危險模式與漸進劣化狀態
+        POST /danger/<device_id>   把指定機台切成危險模式（瞬間拉高振幅）
+        POST /degrade/<device_id>  觸發漸進劣化（頻譜諧波隨時間成長，供 Phase3 AI 驗證）
+        POST /normal/<device_id>   解除該機台的危險模式與漸進劣化
+        POST /quit                 結束整個程式
+    """
+    handler_cls = _make_control_request_handler(danger_flags, degrade_flags, stop_event)
+    server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
+    server.timeout = 0.5  # 讓 handle_request() 最多等 0.5 秒就回來，才能定期檢查 stop_event
+    print(
+        f"[http_control] 控制 API 啟動於 0.0.0.0:{port}"
+        f"（GET /status, POST /danger|degrade|normal/<device>）"
+    )
+    while not stop_event.is_set():
+        server.handle_request()
+    server.server_close()
+
+
 def main():
     """程式進入點：組裝所有元件並啟動整套系統。
 
     啟動順序：
     1. 讀取設定、建立 10 台機台的進程/Queue/危險旗標，並實際 start() 這些進程（Phase1）。
     2. 啟動背景監控 thread：機台健康檢查、系統資源監控（Phase4）。
-    3. 啟動 MQTT 進線 thread。
-    4. 依 NUM_DB_WRITERS 啟動對應數量的平行資料庫寫入 thread，把 10 台機台的 Queue
+    3. 啟動危險模式控制用的 HTTP API thread（背景執行時不方便用 stdin，改用 curl/瀏覽器）。
+    4. 啟動 MQTT 進線 thread。
+    5. 依 NUM_DB_WRITERS 啟動對應數量的平行資料庫寫入 thread，把 10 台機台的 Queue
        平均分配給它們，其中第 0 條順便處理 MQTT 進線的資料（Phase2）。
-    5. 主執行緒進入 control_loop()，等待使用者輸入指令，直到收到 QUIT 或 Ctrl+C。
-    6. 結束時設定 stop_event，並確保 10 台機台的進程都真的被清乾淨（見迴圈內註解）。
+    6. 主執行緒進入 control_loop()，等待使用者輸入指令，直到收到 QUIT 或 Ctrl+C。
+    7. 結束時設定 stop_event，並確保 10 台機台的進程都真的被清乾淨（見迴圈內註解）。
     """
     config = machine_config.load_config()
     stop_event = mp.Event()  # 唯一的全域停止旗標，所有進程/thread 都靠檢查這個來知道該收尾了
-    processes, queues, danger_flags = build_workers(config, stop_event)
+    processes, queues, danger_flags, degrade_flags = build_workers(config, stop_event)
 
     for process in processes:
         process.start()
 
     threading.Thread(target=process_monitor_loop, args=(processes, stop_event), daemon=True).start()
     threading.Thread(target=system_health_loop, args=(stop_event,), daemon=True).start()
+    threading.Thread(
+        target=http_control_loop, args=(danger_flags, degrade_flags, stop_event), daemon=True
+    ).start()
 
     mqtt_queue: "queue.Queue" = queue.Queue()  # 執行緒安全的一般 Queue（不是 multiprocessing.Queue），
     # 因為 MQTT client 的 callback 是在同一個進程內的背景 thread 執行，不需要跨進程 IPC。

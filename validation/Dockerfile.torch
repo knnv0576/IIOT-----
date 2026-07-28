@@ -1,0 +1,3 @@
+# 給 RUL 深度學習實驗用：在 iiot-ai_service（已有 numpy/pandas/scipy/sklearn）上加 PyTorch(CPU)。
+FROM iiot-ai_service
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu

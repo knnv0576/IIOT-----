@@ -2,13 +2,18 @@
   "id": null,
   "uid": "iiot-overview",
   "title": "IIoT 全系統視覺化戰情室",
-  "tags": ["iiot"],
+  "tags": [
+    "iiot"
+  ],
   "timezone": "browser",
   "editable": true,
   "schemaVersion": 39,
   "version": 1,
   "refresh": "5s",
-  "time": { "from": "now-5m", "to": "now" },
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
@@ -16,29 +21,70 @@
         "type": "custom",
         "label": "機台",
         "query": "SCT-01,SCT-02,SCT-03,SCT-04,SCT-05,SCT-06,SCT-07,SCT-08,SCT-09,SCT-10",
-        "current": { "text": "SCT-01", "value": "SCT-01" },
+        "current": {
+          "text": "SCT-01",
+          "value": "SCT-01"
+        },
         "options": [
-          { "text": "SCT-01", "value": "SCT-01", "selected": true },
-          { "text": "SCT-02", "value": "SCT-02" },
-          { "text": "SCT-03", "value": "SCT-03" },
-          { "text": "SCT-04", "value": "SCT-04" },
-          { "text": "SCT-05", "value": "SCT-05" },
-          { "text": "SCT-06", "value": "SCT-06" },
-          { "text": "SCT-07", "value": "SCT-07" },
-          { "text": "SCT-08", "value": "SCT-08" },
-          { "text": "SCT-09", "value": "SCT-09" },
-          { "text": "SCT-10", "value": "SCT-10" }
+          {
+            "text": "SCT-01",
+            "value": "SCT-01",
+            "selected": true
+          },
+          {
+            "text": "SCT-02",
+            "value": "SCT-02"
+          },
+          {
+            "text": "SCT-03",
+            "value": "SCT-03"
+          },
+          {
+            "text": "SCT-04",
+            "value": "SCT-04"
+          },
+          {
+            "text": "SCT-05",
+            "value": "SCT-05"
+          },
+          {
+            "text": "SCT-06",
+            "value": "SCT-06"
+          },
+          {
+            "text": "SCT-07",
+            "value": "SCT-07"
+          },
+          {
+            "text": "SCT-08",
+            "value": "SCT-08"
+          },
+          {
+            "text": "SCT-09",
+            "value": "SCT-09"
+          },
+          {
+            "text": "SCT-10",
+            "value": "SCT-10"
+          }
         ]
       }
     ]
   },
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": []
+  },
   "panels": [
     {
       "id": 100,
       "type": "row",
       "title": "機台狀態即時圖表（$device）",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "collapsed": false,
       "panels": []
     },
@@ -46,10 +92,24 @@
       "id": 1,
       "type": "timeseries",
       "title": "溫度 — $device",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
       "fieldConfig": {
-        "defaults": { "unit": "celsius", "custom": { "drawStyle": "line", "spanNulls": true } },
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          }
+        },
         "overrides": []
       },
       "targets": [
@@ -65,17 +125,47 @@
       "id": 2,
       "type": "timeseries",
       "title": "電流三相 (A/B/C) — $device",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "description": "圖例可點擊：點一下某一相只顯示該相、再點一下恢復全部。1秒彙總後60Hz正弦波已被平均抵消，三相看起來接近是正常現象。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "spanNulls": true } },
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          }
+        },
         "overrides": []
       },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
-          "rawSql": "SELECT ts AS \"time\", sensor_id AS \"metric\", value\nFROM sensor_readings\nWHERE device_id = '$device'\n  AND sensor_id LIKE 'E%'\n  AND $__timeFilter(ts)\nORDER BY ts",
+          "rawSql": "SELECT bucket AS \"time\", sensor_id AS \"metric\", avg_value AS value\nFROM current_1s_agg\nWHERE device_id = '$device' AND $__timeFilter(bucket)\nORDER BY bucket",
           "rawQuery": true
         }
       ]
@@ -84,41 +174,140 @@
       "id": 3,
       "type": "timeseries",
       "title": "三軸合成振動 vs ISO 門檻 — $device",
-      "description": "綠=優良上限、黃=可接受上限、紅=危險門檻（依機台 Class 自動對應）",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "description": "綠=優良上限、黃=可接受上限、紅=危險門檻（依機台 Class 自動對應）。圖例可點擊單獨顯示某一條線。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
       "fieldConfig": {
-        "defaults": { "unit": "velocitymms", "custom": { "drawStyle": "line", "spanNulls": true } },
+        "defaults": {
+          "unit": "velocitymms",
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          }
+        },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "優良上限" },
+            "matcher": {
+              "id": "byName",
+              "options": "優良上限"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
-              { "id": "custom.fillOpacity", "value": 0 }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "可接受上限" },
+            "matcher": {
+              "id": "byName",
+              "options": "可接受上限"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
-              { "id": "custom.fillOpacity", "value": 0 }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "危險門檻" },
+            "matcher": {
+              "id": "byName",
+              "options": "危險門檻"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
-              { "id": "custom.fillOpacity", "value": 0 }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "合成振動" },
+            "matcher": {
+              "id": "byName",
+              "options": "合成振動"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } },
-              { "id": "custom.lineWidth", "value": 2 }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
             ]
           }
         ]
@@ -127,7 +316,7 @@
         {
           "refId": "A",
           "format": "time_series",
-          "rawSql": "SELECT\n  g.ts AS \"time\",\n  sqrt(g.x*g.x + g.y*g.y + g.z*g.z) AS \"合成振動\",\n  t.good_upper AS \"優良上限\",\n  t.acceptable_upper AS \"可接受上限\",\n  t.danger_lower AS \"危險門檻\"\nFROM (\n  SELECT ts,\n         max(value) FILTER (WHERE sensor_id LIKE '%-X') AS x,\n         max(value) FILTER (WHERE sensor_id LIKE '%-Y') AS y,\n         max(value) FILTER (WHERE sensor_id LIKE '%-Z') AS z\n  FROM sensor_readings\n  WHERE device_id = '$device' AND sensor_id LIKE 'V%' AND $__timeFilter(ts)\n  GROUP BY ts\n) g\nCROSS JOIN (\n  SELECT good_upper, acceptable_upper, danger_lower\n  FROM machine_vibration_thresholds WHERE device_id = '$device'\n) t\nORDER BY g.ts",
+          "rawSql": "SELECT\n  v.bucket AS \"time\",\n  sqrt(v.x*v.x + v.y*v.y + v.z*v.z) AS \"合成振動\",\n  t.good_upper AS \"優良上限\",\n  t.acceptable_upper AS \"可接受上限\",\n  t.danger_lower AS \"危險門檻\"\nFROM vibration_1s_agg v\nCROSS JOIN (\n  SELECT good_upper, acceptable_upper, danger_lower\n  FROM machine_vibration_thresholds WHERE device_id = '$device'\n) t\nWHERE v.device_id = '$device' AND $__timeFilter(v.bucket)\nORDER BY v.bucket",
           "rawQuery": true
         }
       ]
@@ -136,7 +325,12 @@
       "id": 200,
       "type": "row",
       "title": "AI 即時警報（$device，門檻規則版，待接 Phase3 AI 推論）",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
       "collapsed": false,
       "panels": []
     },
@@ -144,10 +338,24 @@
       "id": 10,
       "type": "stat",
       "title": "即時異常警報 — $device",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 10 },
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
         "textMode": "value",
         "colorMode": "background",
         "graphMode": "none",
@@ -156,11 +364,44 @@
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "special", "options": { "match": "null+nan", "result": { "text": "NORMAL", "color": "green" } } },
-            { "type": "value", "options": { "0": { "text": "✅ NORMAL", "color": "green" } } },
-            { "type": "regex", "options": { "pattern": "CRITICAL.*", "result": { "color": "red" } } }
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "NORMAL",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "✅ NORMAL",
+                  "color": "green"
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "CRITICAL.*",
+                "result": {
+                  "color": "red"
+                }
+              }
+            }
           ],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": []
       },
@@ -177,7 +418,12 @@
       "id": 300,
       "type": "row",
       "title": "系統健康監控（edge_pipeline 進程）",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
       "collapsed": false,
       "panels": []
     },
@@ -185,9 +431,26 @@
       "id": 20,
       "type": "timeseries",
       "title": "CPU 使用率",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
@@ -201,9 +464,26 @@
       "id": 21,
       "type": "timeseries",
       "title": "記憶體使用量",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "decmbytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decmbytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
@@ -217,9 +497,26 @@
       "id": 22,
       "type": "timeseries",
       "title": "每秒寫入吞吐量 (TPS)",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
@@ -233,15 +530,666 @@
       "id": 23,
       "type": "timeseries",
       "title": "資料庫寫入延遲",
-      "datasource": { "type": "grafana-postgresql-datasource", "uid": "timescaledb" },
-      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
           "rawSql": "SELECT ts AS \"time\", write_latency_ms AS \"延遲(ms)\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts",
           "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 400,
+      "type": "row",
+      "title": "Phase3 AI 剩餘壽命預測（RUL，電流均值+飄移趨勢外推）",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 40,
+      "type": "table",
+      "title": "電流均值 RUL 預測（各相，依緊急程度排序）",
+      "description": "STABLE=沒有顯著飄移趨勢；WARNING=預估30分鐘內觸及電流上/下限；CRITICAL=預估5分鐘內。eta_seconds為預估還要幾秒觸及門檻。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "STABLE": {
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "WARNING": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "CRITICAL": {
+                        "color": "red",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "eta_seconds"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "current_mean"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "drift_rate_per_min"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT device_id, sensor_id, current_mean, drift_rate_per_min, target_threshold, eta_seconds, status\nFROM (\n  SELECT DISTINCT ON (device_id, sensor_id)\n    device_id, sensor_id, current_mean, drift_rate_per_min, target_threshold, eta_seconds, status, ts\n  FROM rul_predictions WHERE metric_kind = 'current_mean'\n  ORDER BY device_id, sensor_id, ts DESC\n) latest\nORDER BY CASE status WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END, eta_seconds NULLS LAST",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 500,
+      "type": "row",
+      "title": "Phase3 AI 振動頻譜預測（RUL + 異常分數 + CUSUM 漸進劣化）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "panels": []
+    },
+    {
+      "id": 50,
+      "type": "table",
+      "title": "振動頻譜 RUL 預測（追蹤 thd_ratio 外推撞 0.05，各軸）",
+      "description": "追蹤諧波比值 thd_ratio 的上升趨勢外推到劣化門檻 0.05。STABLE=無顯著上升；WARNING=預估30分內觸及；CRITICAL=預估5分內。這是振幅還看不出來時就能預測壽命的關鍵。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "STABLE": {
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "WARNING": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "CRITICAL": {
+                        "color": "red",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "eta_seconds"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "thd_ratio"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "thd_per_min"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 6
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT device_id, sensor_id, current_mean AS thd_ratio, drift_rate_per_min AS thd_per_min,\n       target_threshold, eta_seconds, status\nFROM (\n  SELECT DISTINCT ON (device_id, sensor_id)\n    device_id, sensor_id, current_mean, drift_rate_per_min, target_threshold, eta_seconds, status, ts\n  FROM rul_predictions WHERE metric_kind = 'thd_ratio'\n  ORDER BY device_id, sensor_id, ts DESC\n) latest\nORDER BY CASE status WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END, eta_seconds NULLS LAST",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "振動 thd_ratio 頻譜劣化趨勢 — $device（三軸）",
+      "description": "諧波比值隨時間上升代表頻譜劣化；紅線=劣化門檻 0.05。振幅不變時這裡就會先動。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 43
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "decimals": 5,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", thd_ratio AS value, sensor_id AS metric\nFROM anomaly_scores\nWHERE device_id = '$device' AND sensor_id LIKE 'V%' AND thd_ratio IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "振動 CUSUM 漸進劣化累積 — $device（三軸）",
+      "description": "CUSUM 單邊累積「分數持續下滑」的量，持續走高代表偵測到漸進劣化。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 43
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "decimals": 5
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", cusum AS value, sensor_id AS metric\nFROM anomaly_scores\nWHERE device_id = '$device' AND sensor_id LIKE 'V%' AND cusum IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 600,
+      "type": "row",
+      "title": "Phase3 AI 振動 ML 剩餘壽命（RandomForest 模型，rms_norm+kurt+crest+slope → RUL 分鐘）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "panels": []
+    },
+    {
+      "id": 60,
+      "type": "table",
+      "title": "振動 ML RUL 預測（RF 模型，依緊急程度排序）",
+      "description": "由 32 顆真實軸承 run-to-failure 資料訓練的 RandomForest 模型直接輸出剩餘壽命（分鐘），特徵為 rms_norm（現值/健康基線）、kurtosis、crest factor、rms 斜率。STABLE=RUL≥200分；WARNING=<200分；CRITICAL=<60分。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "STABLE": {
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "WARNING": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "CRITICAL": {
+                        "color": "red",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rul_min"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "m"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rms_norm"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rms_slope_per_min"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT device_id, sensor_id, current_mean AS rms_norm, drift_rate_per_min AS rms_slope_per_min,\n       round((eta_seconds/60)::numeric, 0) AS rul_min, status\nFROM (\n  SELECT DISTINCT ON (device_id, sensor_id)\n    device_id, sensor_id, current_mean, drift_rate_per_min, eta_seconds, status, ts\n  FROM rul_predictions WHERE metric_kind = 'ml_rf'\n  ORDER BY device_id, sensor_id, ts DESC\n) latest\nORDER BY CASE status WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END, rul_min NULLS LAST",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "振動 ML RUL 倒數趨勢 — $device（三軸，分鐘）",
+      "description": "RandomForest 模型輸出的剩餘壽命隨時間變化；健康時高、劣化時應一路下降。橘線=200分（WARNING）、紅線=60分（CRITICAL）。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 200
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", eta_seconds/60.0 AS value, sensor_id AS metric\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND eta_seconds IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "振動 rms_norm（現值/健康基線）— $device（三軸）",
+      "description": "ML RUL 最主要的輸入特徵（重要度 57%）。1.0=與健康基線相同；真實軸承磨損末期可達 6~10 倍。持續走高代表振幅型劣化。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", current_mean AS value, sensor_id AS metric\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND current_mean IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
         }
       ]
     }

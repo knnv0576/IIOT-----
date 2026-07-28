@@ -10,3 +10,6 @@ __pycache__/
 
 .DS_Store
 Thumbs.db
+
+# 驗證用的公開資料集（PHM2012 / XJTU-SY 等，好幾 GB，不進 repo）
+validation/data/
