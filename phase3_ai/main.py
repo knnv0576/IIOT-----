@@ -31,7 +31,13 @@ import time
 import numpy as np
 import psycopg2
 
-from anomaly_detector import CusumTracker, WINDOW_SAMPLES, score_latest_window, train_model
+from anomaly_detector import (
+    CUSUM_WARMUP_SAMPLES,
+    CusumTracker,
+    WINDOW_SAMPLES,
+    score_latest_window,
+    train_model,
+)
 
 TIMESCALEDB_DSN = os.environ["TIMESCALEDB_DSN"]
 
@@ -214,6 +220,56 @@ def insert_prediction(
         )
 
 
+def ensure_cusum_baseline_table(conn) -> None:
+    """建立 CUSUM 基線持久化表（若不存在）。存 healthy 校準結果，讓服務重啟能載回、免除每次
+    重啟都要重新暖機（盲窗）。用 CREATE IF NOT EXISTS，對既有 DB 也安全（init.sql 也有一份供全新安裝）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cusum_baselines (
+                device_id TEXT NOT NULL,
+                sensor_id TEXT NOT NULL,
+                mu0 DOUBLE PRECISION NOT NULL,
+                sigma0 DOUBLE PRECISION NOT NULL,
+                low_confidence BOOLEAN NOT NULL DEFAULT FALSE,
+                rejected_frac DOUBLE PRECISION,
+                n_warmup INTEGER,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (device_id, sensor_id)
+            )
+            """
+        )
+
+
+def load_cusum_baseline(conn, device_id, sensor_id):
+    """回傳 (mu0, sigma0, low_confidence)，沒有持久化基線時回傳 None。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT mu0, sigma0, low_confidence FROM cusum_baselines "
+            "WHERE device_id = %s AND sensor_id = %s",
+            (device_id, sensor_id),
+        )
+        return cur.fetchone()
+
+
+def save_cusum_baseline(conn, device_id, sensor_id, tracker) -> None:
+    """把現場暖機得到的健康基線 upsert 進 DB，下次重啟即可載回免暖機。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO cusum_baselines
+                (device_id, sensor_id, mu0, sigma0, low_confidence, rejected_frac, n_warmup, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (device_id, sensor_id) DO UPDATE SET
+                mu0 = EXCLUDED.mu0, sigma0 = EXCLUDED.sigma0,
+                low_confidence = EXCLUDED.low_confidence, rejected_frac = EXCLUDED.rejected_frac,
+                n_warmup = EXCLUDED.n_warmup, updated_at = now()
+            """,
+            (device_id, sensor_id, tracker.mu0, tracker.sigma0, tracker.low_confidence,
+             tracker.rejected_frac, CUSUM_WARMUP_SAMPLES),
+        )
+
+
 def insert_anomaly_score(conn, device_id, sensor_id, score, is_anomaly, features, cusum, cusum_alarm) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -237,6 +293,8 @@ _anomaly_models: dict[tuple[str, str], dict] = {}
 _cusum_trackers: dict[tuple[str, str], CusumTracker] = {}
 # {(device_id, sensor_id): onset_epoch}；CUSUM 首次警報的時刻，兩段式 RUL 用它當劣化起點錨。
 _rul_onset: dict[tuple[str, str], float] = {}
+# {(device_id, sensor_id): 已記錄的 calib_generation}；每完成一次校準才記/存一次（含重新校準）。
+_cusum_calib_gen: dict[tuple[str, str], int] = {}
 # {(device_id, sensor_id): 健康基線 rms}；ML RUL 的 rms_norm=現值/基線，用最早幾筆健康 rms 算一次。
 _rms_baseline: dict[tuple[str, str], float] = {}
 
@@ -308,7 +366,11 @@ def run_anomaly_detection_cycle(conn) -> None:
                 if bundle is None:
                     continue  # 歷史資料還不夠，下一輪再試
                 _anomaly_models[key] = bundle
-                _cusum_trackers[key] = CusumTracker()
+                tracker = CusumTracker()
+                baseline = load_cusum_baseline(conn, device_id, sensor_id)
+                if baseline is not None:  # 有持久化基線 → 載回、跳過現場暖機（進再驗證期）
+                    tracker.load_baseline(baseline[0], baseline[1], baseline[2])
+                _cusum_trackers[key] = tracker
                 kind = "電流" if sensor_id.startswith("E") else "振動"
                 print(
                     f"[ai_service] {device_id}/{sensor_id}（{kind} {fundamental_hz:.0f}Hz）頻譜異常模型訓練完成"
@@ -319,8 +381,39 @@ def run_anomaly_detection_cycle(conn) -> None:
             if result is None:
                 continue
             score, is_anomaly, features = result
-            cusum_value, is_degrading = _cusum_trackers[key].update(score)
+            tracker = _cusum_trackers[key]
+            cusum_value, is_degrading = tracker.update(score)
             insert_anomaly_score(conn, device_id, sensor_id, score, is_anomaly, features, cusum_value, is_degrading)
+
+            # 載入基線與新模型分數不一致（模型重訓漂移）→ tracker 已自動改重新暖機，這裡記一次。
+            if tracker.reval_failed:
+                tracker.reval_failed = False
+                _cusum_calib_gen.pop(key, None)  # 讓接下來重新暖機的校準能再記/存一次
+                print(
+                    f"[ai_service] CUSUM 載入基線與新模型分數不一致（重訓漂移），改重新暖機: "
+                    f"{device_id}/{sensor_id}"
+                )
+
+            # 每完成一次校準（含重新校準）記/存一次：載入的印提示、現場暖機的存進 DB 供下次免暖機。
+            if tracker.calibrated and _cusum_calib_gen.get(key) != tracker.calib_generation:
+                _cusum_calib_gen[key] = tracker.calib_generation
+                if tracker.source == "loaded":
+                    print(
+                        f"[ai_service] CUSUM 基線已載回（跳過暖機、再驗證中）: {device_id}/{sensor_id} "
+                        f"mu0={tracker.mu0:.3f} sigma0={tracker.sigma0:.3f}"
+                    )
+                elif tracker.low_confidence:
+                    print(
+                        f"[ai_service] CUSUM 校準低信心: {device_id}/{sensor_id}"
+                        f"（暖機剔除 {tracker.rejected_frac:.0%}、地板已自動抬高保守處理，"
+                        f"建議檢查該通道暖機期是否非穩態；不存檔）"
+                    )
+                else:
+                    save_cusum_baseline(conn, device_id, sensor_id, tracker)  # 乾淨校準才存
+                    print(
+                        f"[ai_service] CUSUM 基線已存檔（下次重啟免暖機）: {device_id}/{sensor_id} "
+                        f"mu0={tracker.mu0:.3f} sigma0={tracker.sigma0:.3f}"
+                    )
 
             # 兩段式 RUL 的階段1：CUSUM 首次警報 = 劣化 onset，記下時刻當趨勢 fit 的起點錨。
             if is_degrading and key not in _rul_onset:
@@ -354,10 +447,12 @@ def main() -> None:
     )
     print(
         f"[ai_service] 頻譜異常評分啟動：每 {ANOMALY_CHECK_INTERVAL:.0f}s 一輪、每個特徵窗口 {WINDOW_SAMPLES} 筆，"
-        f"涵蓋電流({CURRENT_FUNDAMENTAL_HZ:.0f}Hz) + 振動({VIBRATION_FUNDAMENTAL_HZ:.0f}Hz) 共 6 通道/台，含線上 CUSUM 漸進劣化偵測"
+        f"涵蓋電流({CURRENT_FUNDAMENTAL_HZ:.0f}Hz) + 振動({VIBRATION_FUNDAMENTAL_HZ:.0f}Hz) 共 6 通道/台，"
+        f"含線上 CUSUM 漸進劣化偵測（robust 校準 + 基線持久化，重啟免暖機）"
     )
 
     conn = connect()
+    ensure_cusum_baseline_table(conn)  # CUSUM 基線持久化表（重啟免暖機）
     connection_ok = True
     last_reconnect_attempt = 0.0
     last_anomaly_check = 0.0

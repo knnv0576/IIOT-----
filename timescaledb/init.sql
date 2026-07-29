@@ -202,6 +202,21 @@ SELECT create_hypertable('anomaly_scores', 'ts', chunk_time_interval => INTERVAL
 CREATE INDEX IF NOT EXISTS idx_anomaly_scores_device_sensor_ts
     ON anomaly_scores (device_id, sensor_id, ts DESC);
 
+-- CUSUM 基線持久化：每通道一列，存 Phase3 AI 現場暖機得到的健康基線 mu0/sigma0。服務重啟時載回，
+-- 免除「每次重啟都要重新暖機」的偵測盲窗，也讓一次乾淨的長校準結果能被反覆沿用。
+-- 非 hypertable（資料量極小，最多 60 列）。ai_service 啟動時也會 CREATE IF NOT EXISTS，對既有 DB 安全。
+CREATE TABLE IF NOT EXISTS cusum_baselines (
+    device_id      TEXT              NOT NULL,
+    sensor_id      TEXT              NOT NULL,
+    mu0            DOUBLE PRECISION  NOT NULL,  -- 健康分數基準均值
+    sigma0         DOUBLE PRECISION  NOT NULL,  -- 健康分數基準散布（robust 估計）
+    low_confidence BOOLEAN           NOT NULL DEFAULT FALSE,  -- 校準可信度旗標（低信心者不存，此欄留給未來）
+    rejected_frac  DOUBLE PRECISION,            -- 暖機被 robust 修剪剔除的比例
+    n_warmup       INTEGER,                     -- 校準用的暖機樣本數
+    updated_at     TIMESTAMPTZ       NOT NULL DEFAULT now(),
+    PRIMARY KEY (device_id, sensor_id)
+);
+
 -- 容量保險絲：TimescaleDB 的保留政策只支援「按時間」，但以每秒十幾萬筆的持續寫入，
 -- 30 天時間保留根本來不及擋（實測 4kHz 全速跑 9 小時就累積 81GB、曾把系統碟撐爆）。
 -- 這個自訂排程工作每 5 分鐘檢查 sensor_readings 的實際大小，超過 limit_gb
