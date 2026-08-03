@@ -68,9 +68,11 @@ def replay_channel(scores: np.ndarray) -> tuple[int, int, int | None]:
 
 def run_sweep(floors, channels, samples, mu0, sigma0, dist, interval, seed, score_streams):
     rng = np.random.default_rng(seed)
-    print(f"{'地板':>5} | {'窗內誤報onset通道':>16} | {'中位首次穿越':>12} | "
-          f"{'實測ARL':>9} | {'單通道假警間隔':>14} | {'理論ARL':>8}")
-    print("-" * 84)
+    # ISA-18.2：穩態下每位操作員應 < 6 則告警/小時（>30 視為告警洪水）。操作員感受到的是整個機隊，
+    # 所以要把單通道假警率乘上通道數才是真正該對照的數字——這是選地板的客觀驗收標準。
+    print(f"{'地板':>5} | {'誤報onset通道':>13} | {'單通道假警間隔':>14} | "
+          f"{'機隊告警率(則/小時)':>18} | {'ISA-18.2':>10} | {'理論ARL':>8}")
+    print("-" * 92)
     for f in floors:
         ad.CUSUM_H_FLOOR_MULT = f  # monkeypatch：tracker.update() 會在校準時讀這個模組全域
         total_post, total_events, ch_onset = 0, 0, 0
@@ -93,10 +95,15 @@ def run_sweep(floors, channels, samples, mu0, sigma0, dist, interval, seed, scor
         secs = emp_arl * interval if not np.isinf(emp_arl) else None
         interval_txt = ("無假警" if secs is None
                         else (f"{secs/3600:.1f} 小時" if secs < 3 * 86400 else f"{secs/86400:.1f} 天"))
-        arl_txt = f"{emp_arl:.0f}" if not np.isinf(emp_arl) else "∞"
-        fp_txt = f"{int(np.median(first_passages))} 樣本" if first_passages else "—"
-        print(f"{f:>4.0f}σ | {ch_onset:>6}/{n_ch:<8} | {fp_txt:>12} | {arl_txt:>9} | "
-              f"{interval_txt:>14} | {theoretical_arl(f):>8.0f}")
+        # 機隊告警率：單通道每小時假警數 × 通道數
+        if secs is None:
+            fleet_rate, verdict = 0.0, "✅ 合格"
+        else:
+            fleet_rate = (3600.0 / secs) * n_ch
+            verdict = ("✅ 合格" if fleet_rate < 6 else
+                       "⚠️ 偏高" if fleet_rate < 30 else "❌ 告警洪水")
+        print(f"{f:>4.0f}σ | {ch_onset:>6}/{n_ch:<6} | {interval_txt:>14} | "
+              f"{fleet_rate:>18.1f} | {verdict:>10} | {theoretical_arl(f):>8.0f}")
 
 
 def main():

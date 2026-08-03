@@ -26,6 +26,7 @@ CURRENT 設定保持一致（兩個服務目前是分開的 Docker context，沒
 
 import os
 import pickle
+import threading
 import time
 
 import numpy as np
@@ -59,6 +60,14 @@ ML_RUL_MIN_POINTS = 10       # 至少要有這麼多 rms 歷史點才預測
 ML_BASELINE_POINTS = 20      # 用最早這麼多筆 rms 當「健康基線」
 ML_RUL_WARNING_MIN = 200.0   # RUL < 這麼多分鐘 → WARNING；< ML_RUL_CRITICAL_MIN → CRITICAL
 ML_RUL_CRITICAL_MIN = 60.0
+# 判定 status 時要用哪個 RUL 值（ISO 13381-1 精神：在不確定性下做決策）。
+# 'mean'（預設）＝用點估計，維持既有告警行為。
+# 'p10'＝用悲觀界（有 10% 機率比這更早壞），可抵銷「模型在最後 60 分鐘高估 RUL」的已知失效模式
+#（IMS 0~30 分帶平均高估 47 分）——但**切換時必須同時重新校準下面兩個門檻**：實測健康態的
+# 點估計約 223 分、P10 約 190 分，直接沿用 200/60 會讓健康通道全部站在 WARNING（常駐告警，
+# 違反 ISA-18.2）。若要改用 p10，建議 ML_RUL_WARNING_MIN≈170、ML_RUL_CRITICAL_MIN≈50。
+# 不論用哪個判定，P10/P90 都會照常存進 DB 與儀表板供人判讀（ISO 13381-1 的信賴區間要求）。
+ML_RUL_STATUS_QUANTILE = os.environ.get("ML_RUL_STATUS_QUANTILE", "mean")
 
 PREDICTION_INTERVAL = float(os.environ.get("RUL_PREDICTION_INTERVAL", "15"))  # 每隔幾秒跑一輪 RUL 預測
 WINDOW_SECONDS = float(os.environ.get("RUL_WINDOW_SECONDS", "120"))  # RUL 回歸視窗長度（秒）
@@ -69,6 +78,20 @@ ANOMALY_CHECK_INTERVAL = float(os.environ.get("ANOMALY_CHECK_INTERVAL", "30"))  
 
 CURRENT_UPPER = 6.5
 CURRENT_LOWER = 5.5
+
+# 時域絕對門檻的災難兜底（改動2）：三軸 RMS 合成幅值超過 ISO 危險線就強制 CRITICAL，不看 SVM/CUSUM。
+# 這是「附加」在既有頻譜偵測之上的最後一道保險，專門接住學習型模型失效（模型沒訓練成功、基線被污染）
+# 時的嚴重超標。門檻讀 machine_vibration_thresholds.danger_lower（定義在三軸合成幅值上，故用三軸 RMS
+# 平方和開根還原到同一量綱；用 RMS 而非峰值＝較平滑、與 1 秒彙總的顯示口徑一致）。
+#
+# 跑在「獨立執行緒 + 獨立連線」上，不跟昂貴的 FFT/SVM 路徑綁在一起：保險絲只需要 RMS（很便宜），
+# 不該被 ML 路徑拖慢或餓死。這是安全兜底該有的性質。
+VIB_TRIP_CHECK_INTERVAL = float(os.environ.get("VIB_TRIP_CHECK_INTERVAL", "10"))  # 跳線自己的檢查週期（秒）
+VIB_TRIP_WINDOW_SECONDS = float(os.environ.get("VIB_TRIP_WINDOW_SECONDS", "2.0"))  # 每次算 RMS 的取樣窗長
+VIB_TRIP_DEBOUNCE_CYCLES = int(os.environ.get("VIB_TRIP_DEBOUNCE_CYCLES", "3"))  # 連續超標幾輪才判（3×10s=30s）
+# 重置遲滯（ISA-18.2 防抖動）：跳閘後要掉到「門檻 × 此比例」以下才算條件解除，
+# 否則在門檻邊緣徘徊會 trip/clear 反覆跳。
+VIB_TRIP_RESET_RATIO = float(os.environ.get("VIB_TRIP_RESET_RATIO", "0.9"))
 
 # 頻譜訊號版振動 RUL：不追蹤振動「振幅」（SCT-05 實驗證實振幅在頻譜劣化時幾乎不動），
 # 改追蹤 thd_ratio（諧波/基頻能量比）的上升趨勢——它在劣化早期就穩定爬升。做法跟電流 RUL
@@ -204,19 +227,22 @@ def predict_spectral_rul(slope: float, r_squared: float, recent_thd: float):
 
 def insert_prediction(
     conn, device_id, sensor_id, value, slope, r_squared, target, eta_seconds, status,
-    metric_kind: str = "current_mean",
+    metric_kind: str = "current_mean", eta_p10_seconds=None, eta_p90_seconds=None,
 ) -> None:
     """metric_kind：被追蹤的量——電流 RUL 是 'current_mean'（電流均值），
-    振動頻譜 RUL 是 'thd_ratio'（諧波比值）。value 欄位存的就是該量的目前值。"""
+    振動頻譜 RUL 是 'thd_ratio'（諧波比值）。value 欄位存的就是該量的目前值。
+    eta_p10/p90：ISO 13381-1 要求的信賴區間（目前只有 ML RUL 有，其餘傳 None）。"""
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO rul_predictions
                 (ts, device_id, sensor_id, current_mean, drift_rate_per_min, r_squared,
-                 target_threshold, eta_seconds, status, metric_kind)
-            VALUES (now(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 target_threshold, eta_seconds, status, metric_kind,
+                 eta_p10_seconds, eta_p90_seconds)
+            VALUES (now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (device_id, sensor_id, value, slope * 60, r_squared, target, eta_seconds, status, metric_kind),
+            (device_id, sensor_id, value, slope * 60, r_squared, target, eta_seconds, status,
+             metric_kind, eta_p10_seconds, eta_p90_seconds),
         )
 
 
@@ -297,6 +323,10 @@ _rul_onset: dict[tuple[str, str], float] = {}
 _cusum_calib_gen: dict[tuple[str, str], int] = {}
 # {(device_id, sensor_id): 健康基線 rms}；ML RUL 的 rms_norm=現值/基線，用最早幾筆健康 rms 算一次。
 _rms_baseline: dict[tuple[str, str], float] = {}
+# {device_id: danger_lower}；振動危險門檻快取（靜態設定，讀一次）。None=該台無門檻，跳線 fail-safe 跳過。
+_vib_danger_threshold: dict[str, "float | None"] = {}
+# {device_id: 連續超標輪數}；時域跳線去抖動計數。
+_vib_trip_streak: dict[str, int] = {}
 
 
 def fetch_rms_history(conn, device_id, sensor_id, window_seconds):
@@ -334,7 +364,13 @@ def get_rms_baseline(conn, device_id, sensor_id):
 
 
 def ml_vibration_rul(conn, device_id, sensor_id):
-    """用 RF 模型從時域特徵預測 RUL（分鐘）。回傳 (rul_min, rms_norm, slope_per_min)，資料不足回傳 None。"""
+    """用 RF 模型從時域特徵預測 RUL（分鐘）。
+    回傳 (rul_min, p10_min, p90_min, rms_norm, slope_per_min)，資料不足回傳 None。
+
+    p10/p90 是 ISO 13381-1 要求的信賴區間：RandomForest 的每一棵樹各自是一個獨立預測，
+    取這個分布的分位數就得到「免費」的預測區間，不需要重訓或額外模型。
+    P10=悲觀界（有 10% 機率比這更早壞）、P90=樂觀界。
+    """
     if _RUL_MODEL is None:
         return None
     baseline = get_rms_baseline(conn, device_id, sensor_id)
@@ -351,8 +387,175 @@ def ml_vibration_rul(conn, device_id, sensor_id):
     tm = (t - t[0]) / 60.0
     slope = float(np.polyfit(tm, rms_norm_series, 1)[0]) if len(rows) >= 3 else 0.0
     kurt, crest = float(rows[-1][2]), float(rows[-1][3])
-    rul_min = float(_RUL_MODEL.predict([[rms_norm, kurt, crest, slope]])[0])
-    return rul_min, rms_norm, slope
+    features = [[rms_norm, kurt, crest, slope]]
+    rul_min = float(_RUL_MODEL.predict(features)[0])
+    try:
+        tree_preds = np.array([est.predict(features)[0] for est in _RUL_MODEL.estimators_])
+        p10, p90 = (float(v) for v in np.percentile(tree_preds, [10, 90]))
+    except AttributeError:  # 非樹系模型（例如日後換成 LSTM）就沒有區間，不讓服務掛掉
+        p10 = p90 = None
+    return rul_min, p10, p90, rms_norm, slope
+
+
+def get_vib_danger_threshold(conn, device_id):
+    """讀該台振動危險門檻（三軸合成幅值上的 danger_lower），快取。無門檻回 None（跳線會 fail-safe 跳過）。"""
+    if device_id in _vib_danger_threshold:
+        return _vib_danger_threshold[device_id]
+    with conn.cursor() as cur:
+        cur.execute("SELECT danger_lower FROM machine_vibration_thresholds WHERE device_id = %s", (device_id,))
+        row = cur.fetchone()
+    val = float(row[0]) if row and row[0] is not None else None
+    _vib_danger_threshold[device_id] = val
+    return val
+
+
+def ensure_vib_trip_latch_table(conn) -> None:
+    """建立跳閘閂鎖表（若不存在）。閂鎖＝跳閘後即使振動回到正常也維持 CRITICAL，直到人工確認，
+    避免災難事件的紀錄自己消失（ISA-18.2 標準告警語意）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vib_trip_latches (
+                device_id       TEXT PRIMARY KEY,
+                tripped_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                danger_line     DOUBLE PRECISION NOT NULL,
+                peak_mag_rms    DOUBLE PRECISION NOT NULL,
+                last_mag_rms    DOUBLE PRECISION,
+                acknowledged    BOOLEAN NOT NULL DEFAULT FALSE,
+                acknowledged_at TIMESTAMPTZ
+            )
+            """
+        )
+
+
+def fetch_vib_rms_all(conn) -> dict:
+    """一次查回全機隊各振動通道最近 VIB_TRIP_WINDOW_SECONDS 秒的 RMS。
+    定義與 spectral_features.extract_features 的 rms 一致（含直流），確保與既有門檻口徑相同。
+    回傳 {device_id: {軸: rms}}。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT device_id, sensor_id, sqrt(avg(value * value)) AS rms
+            FROM sensor_readings
+            WHERE sensor_id LIKE 'V%%' AND ts > now() - (%s * interval '1 second')
+            GROUP BY device_id, sensor_id
+            """,
+            (VIB_TRIP_WINDOW_SECONDS,),
+        )
+        out: dict = {}
+        for device_id, sensor_id, rms in cur.fetchall():
+            if rms is None:
+                continue
+            out.setdefault(device_id, {})[sensor_id.split("-")[-1]] = float(rms)
+        return out
+
+
+def load_vib_latches(conn) -> dict:
+    """回傳 {device_id: acknowledged}，代表目前處於閂鎖中的機台。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT device_id, acknowledged FROM vib_trip_latches")
+        return {row[0]: bool(row[1]) for row in cur.fetchall()}
+
+
+def set_vib_latch(conn, device_id, danger, mag_rms) -> None:
+    """新跳閘：建立閂鎖。已存在則只更新峰值/最近值（ON CONFLICT 保住原始 tripped_at 與確認狀態）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO vib_trip_latches (device_id, danger_line, peak_mag_rms, last_mag_rms)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (device_id) DO UPDATE SET
+                peak_mag_rms = GREATEST(vib_trip_latches.peak_mag_rms, EXCLUDED.peak_mag_rms),
+                last_mag_rms = EXCLUDED.last_mag_rms
+            """,
+            (device_id, danger, mag_rms, mag_rms),
+        )
+
+
+def clear_vib_latch(conn, device_id) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM vib_trip_latches WHERE device_id = %s", (device_id,))
+
+
+def run_vibration_trip_cycle(conn) -> None:
+    """時域絕對門檻的災難兜底一輪：三軸 RMS 合成幅值 ≥ ISO 危險線就強制 CRITICAL（不看 SVM/CUSUM）。
+
+    護欄：
+    - fail-safe：三軸沒湊齊或該台無門檻就跳過（寧可不跳，也不因缺資料誤跳/崩潰）。
+    - 去抖動：需連續 VIB_TRIP_DEBOUNCE_CYCLES 輪超標才判，防單發瞬態。
+    - 遲滯：跳閘後要掉到 danger×VIB_TRIP_RESET_RATIO 以下才算條件解除，防門檻邊緣抖動。
+    - 閂鎖：跳閘後維持 CRITICAL 直到「人工確認 且 條件已解除」才復歸（ISA-18.2 語意）。
+    出口：rul_predictions(metric_kind='vib_trip', status='CRITICAL', eta=0)。
+    """
+    rms_by_device = fetch_vib_rms_all(conn)
+    latches = load_vib_latches(conn)
+
+    for device_id, axes in rms_by_device.items():
+        if len(axes) < 3:
+            continue  # fail-safe：三軸沒湊齊，無法算合成幅值
+        danger = get_vib_danger_threshold(conn, device_id)
+        if danger is None or danger <= 0:
+            continue  # fail-safe：沒有門檻就不跳線
+        mag_rms = float(np.sqrt(sum(v * v for v in axes.values())))
+        latched = device_id in latches
+        over = mag_rms >= danger
+        cleared = mag_rms < danger * VIB_TRIP_RESET_RATIO  # 遲滯：介於兩者之間視為「仍在告警帶」
+
+        if over:
+            _vib_trip_streak[device_id] = _vib_trip_streak.get(device_id, 0) + 1
+        elif cleared:
+            _vib_trip_streak[device_id] = 0
+        # else：落在遲滯帶內（danger×ratio ~ danger），維持現狀不累加也不重置
+
+        n = int(device_id.split("-")[1])
+        if _vib_trip_streak.get(device_id, 0) >= VIB_TRIP_DEBOUNCE_CYCLES and not latched:
+            set_vib_latch(conn, device_id, danger, mag_rms)
+            latched = True
+            latches[device_id] = False
+            print(
+                f"[ai_service] 時域超標強制 CRITICAL（已閂鎖）: {device_id} 三軸合成 RMS={mag_rms:.3f} "
+                f"≥ 危險線={danger:.3f}（連續 {VIB_TRIP_DEBOUNCE_CYCLES} 輪超標，不看 SVM）。"
+                f"確認方式：UPDATE vib_trip_latches SET acknowledged=true, acknowledged_at=now() "
+                f"WHERE device_id='{device_id}';"
+            )
+
+        if latched:
+            # 復歸條件（ISA-18.2）：必須「已人工確認」且「條件已解除」，兩者缺一不可。
+            if latches[device_id] and cleared:
+                clear_vib_latch(conn, device_id)
+                _vib_trip_streak[device_id] = 0
+                print(f"[ai_service] 跳閘已確認且振動回到門檻下，閂鎖解除: {device_id}")
+                continue
+            set_vib_latch(conn, device_id, danger, mag_rms)  # 更新峰值/最近值
+            insert_prediction(
+                conn, device_id, f"V{n:02d}", mag_rms, 0.0, None, danger, 0.0, "CRITICAL",
+                metric_kind="vib_trip",
+            )
+
+
+def vibration_trip_loop() -> None:
+    """獨立執行緒：跳線跑自己的節奏、用自己的連線，不被昂貴的 FFT/SVM 路徑拖慢或餓死。"""
+    conn = None
+    while True:
+        try:
+            if conn is None:
+                conn = connect()
+                ensure_vib_trip_latch_table(conn)
+            run_vibration_trip_cycle(conn)
+        except Exception as exc:
+            # 刻意捕捉所有例外，不只 psycopg2.Error：這是安全兜底，執行緒「靜默死掉」是最糟的
+            # 失效模式（之後完全沒保護、卻沒人知道）。任何錯誤都記錄下來、重連後繼續跑。
+            print(
+                f"[ai_service] 振動跳線本輪失敗（{exc.__class__.__name__}: {exc}），"
+                f"重連後繼續（保險絲不會因單次錯誤停止運作）"
+            )
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
+        time.sleep(VIB_TRIP_CHECK_INTERVAL)
 
 
 def run_anomaly_detection_cycle(conn) -> None:
@@ -443,7 +646,8 @@ def main() -> None:
     print(
         f"[ai_service] RUL 預測服務啟動：視窗={WINDOW_SECONDS:.0f}s、間隔={PREDICTION_INTERVAL:.0f}s、"
         f"電流均值 RUL 門檻=[{CURRENT_LOWER},{CURRENT_UPPER}]%；"
-        f"振動 RUL 改用 ML 模型（RF，{ml}；32 顆真實軸承訓練、跨 IMS 泛化驗證）"
+        f"振動 RUL 改用 ML 模型（RF，{ml}；32 顆真實軸承訓練、跨 IMS 泛化驗證，"
+        f"附 P10~P90 信賴區間、status 以 {ML_RUL_STATUS_QUANTILE} 判定）"
     )
     print(
         f"[ai_service] 頻譜異常評分啟動：每 {ANOMALY_CHECK_INTERVAL:.0f}s 一輪、每個特徵窗口 {WINDOW_SAMPLES} 筆，"
@@ -451,8 +655,17 @@ def main() -> None:
         f"含線上 CUSUM 漸進劣化偵測（robust 校準 + 基線持久化，重啟免暖機）"
     )
 
+    print(
+        f"[ai_service] 振動時域跳線啟動（災難兜底）：獨立執行緒每 {VIB_TRIP_CHECK_INTERVAL:.0f}s 檢查一次、"
+        f"連續 {VIB_TRIP_DEBOUNCE_CYCLES} 輪超標才判 CRITICAL"
+        f"（≈{VIB_TRIP_CHECK_INTERVAL * VIB_TRIP_DEBOUNCE_CYCLES:.0f}s），"
+        f"遲滯 {VIB_TRIP_RESET_RATIO:.0%}、跳閘閂鎖至人工確認"
+    )
+
     conn = connect()
     ensure_cusum_baseline_table(conn)  # CUSUM 基線持久化表（重啟免暖機）
+    ensure_vib_trip_latch_table(conn)  # 跳閘閂鎖表
+    threading.Thread(target=vibration_trip_loop, daemon=True).start()
     connection_ok = True
     last_reconnect_attempt = 0.0
     last_anomaly_check = 0.0
@@ -498,16 +711,20 @@ def main() -> None:
                     result = ml_vibration_rul(conn, device_id, sensor_id)
                     if result is None:
                         continue  # 模型未載入或資料不足（含健康基線還沒建好），下一輪再說
-                    rul_min, rms_norm, slope = result
-                    if rul_min < ML_RUL_CRITICAL_MIN:
+                    rul_min, p10_min, p90_min, rms_norm, slope = result
+                    # 判定基準：預設用 P10（悲觀界），抵銷模型末期高估 RUL 的已知失效模式。
+                    basis = p10_min if (ML_RUL_STATUS_QUANTILE == "p10" and p10_min is not None) else rul_min
+                    if basis < ML_RUL_CRITICAL_MIN:
                         status = "CRITICAL"
-                    elif rul_min < ML_RUL_WARNING_MIN:
+                    elif basis < ML_RUL_WARNING_MIN:
                         status = "WARNING"
                     else:
                         status = "STABLE"
                     insert_prediction(
                         conn, device_id, sensor_id, rms_norm, slope, None, ML_MAX_RUL_MIN,
                         rul_min * 60.0, status, metric_kind="ml_rf",
+                        eta_p10_seconds=None if p10_min is None else p10_min * 60.0,
+                        eta_p90_seconds=None if p90_min is None else p90_min * 60.0,
                     )
                     if status in ("WARNING", "CRITICAL"):
                         warnings.append((device_id, sensor_id, status, rul_min * 60.0))

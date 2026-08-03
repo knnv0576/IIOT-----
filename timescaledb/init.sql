@@ -159,11 +159,18 @@ CREATE TABLE IF NOT EXISTS rul_predictions (
     target_threshold    DOUBLE PRECISION,  -- 預測會撞到的門檻（電流上下限 或 thd 劣化門檻）
     eta_seconds         DOUBLE PRECISION,  -- 預估還要多久會撞到門檻；NULL 代表目前判定為穩定、無法/不需要預測
     status              TEXT              NOT NULL,  -- STABLE / WARNING / CRITICAL
-    metric_kind         TEXT              -- 'current_mean'(電流均值 RUL) 或 'thd_ratio'(振動頻譜 RUL)
+    metric_kind         TEXT,             -- 'current_mean'(電流均值 RUL) 或 'thd_ratio'(振動頻譜 RUL)
+    -- ISO 13381-1 要求預後結果要附信賴區間、不能只給點估計（實測本模型相對誤差 60~70%，
+    -- 只報單一數字會誤導）。ML RUL(metric_kind='ml_rf') 由 RandomForest 各棵樹的預測分布取分位數，
+    -- P10=悲觀界(有 10% 機率更早壞)、P90=樂觀界。其他 metric_kind 目前為 NULL。
+    eta_p10_seconds     DOUBLE PRECISION,
+    eta_p90_seconds     DOUBLE PRECISION
 );
 
--- 舊資料卷升級用：metric_kind 是後來才加的。
+-- 舊資料卷升級用：這些欄位是後來才加的。
 ALTER TABLE rul_predictions ADD COLUMN IF NOT EXISTS metric_kind TEXT;
+ALTER TABLE rul_predictions ADD COLUMN IF NOT EXISTS eta_p10_seconds DOUBLE PRECISION;
+ALTER TABLE rul_predictions ADD COLUMN IF NOT EXISTS eta_p90_seconds DOUBLE PRECISION;
 
 SELECT create_hypertable('rul_predictions', 'ts', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
 
@@ -201,6 +208,20 @@ SELECT create_hypertable('anomaly_scores', 'ts', chunk_time_interval => INTERVAL
 
 CREATE INDEX IF NOT EXISTS idx_anomaly_scores_device_sensor_ts
     ON anomaly_scores (device_id, sensor_id, ts DESC);
+
+-- 振動時域跳線的閂鎖表：三軸 RMS 合成幅值超過 ISO 危險線（machine_vibration_thresholds.danger_lower）
+-- 時，Phase3 AI 會強制判 CRITICAL 並在此建立閂鎖。閂鎖後即使振動回到正常也維持 CRITICAL，
+-- 直到「人工確認 且 條件已解除」才復歸（ISA-18.2 告警語意），避免災難事件的紀錄自己消失。
+-- 人工確認：UPDATE vib_trip_latches SET acknowledged=true, acknowledged_at=now() WHERE device_id='SCT-01';
+CREATE TABLE IF NOT EXISTS vib_trip_latches (
+    device_id       TEXT PRIMARY KEY,
+    tripped_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    danger_line     DOUBLE PRECISION NOT NULL,  -- 當時生效的危險門檻
+    peak_mag_rms    DOUBLE PRECISION NOT NULL,  -- 本次事件的合成 RMS 峰值
+    last_mag_rms    DOUBLE PRECISION,           -- 最近一次量到的合成 RMS
+    acknowledged    BOOLEAN          NOT NULL DEFAULT FALSE,
+    acknowledged_at TIMESTAMPTZ
+);
 
 -- CUSUM 基線持久化：每通道一列，存 Phase3 AI 現場暖機得到的健康基線 mu0/sigma0。服務重啟時載回，
 -- 免除「每次重啟都要重新暖機」的偵測盲窗，也讓一次乾淨的長校準結果能被反覆沿用。

@@ -121,13 +121,16 @@ CUSUM_SLACK_K = 0.5        # slack = CUSUM_SLACK_K * sigma0，吸收正常隨機
 # 動機：固定 h=8*sigma0 偏保守，緩慢劣化要拖到接近末期 value 才跨得過去（onset 太晚才亮）；
 # 而且暖機期若碰到吵的一段、sigma0 被高估，h 在絕對值上過大會「永不觸發」（V05-X 就是這樣，
 # 才臨時加了 thd-floor 補丁）。改成 h 從 8*sigma0 起、每過一個衰減週期 *0.8、滑到地板 5*sigma0 就停住。
-# 地板取 5*sigma0 的依據：偵測力上 3~12σ 都能 17/17 命中，但「誤報率」對 h 極敏感——用 Siegmund 近似
-# （k=0.5），單通道假警平均間隔 ARL 每降 1σ 約縮 3 倍（8σ≈19000 樣本、5σ≈940、3σ≈120）。5σ 從實測
-# 穩定的 8σ 只降一階、拿回約 20× 靈敏度，又離 3~4σ 的誤報懸崖有安全距離；配合警報低代價（只標 onset）
-# 與 thd-floor 兜底，殘餘誤報後果輕微。實際地板值請用 validation/cusum_false_alarm_replay.py 對健康資料
-# 重放定案（理論定起點、實測定案）。重新校準（重建 tracker）時衰減時鐘歸零。
+# 地板取 7*sigma0 的依據（2026-08 依 ISA-18.2 修正，原本訂 5σ 是錯的）：
+# 偵測力上 3~12σ 都能 17/17 命中，但「誤報率」對 h 極敏感——用 Siegmund 近似（k=0.5），單通道假警
+# 平均間隔 ARL 每降 1σ 約縮 3 倍。原本只看「單通道」ARL 覺得 5σ 還算安靜，但**操作員感受到的是整個
+# 機隊**：60 通道（6/台×10 台）同時跑，機隊告警率 = 單通道率 × 60。用 validation/cusum_false_alarm_replay.py
+# 實測換算：5σ→約 21 則/小時、8σ→約 3 則/小時。ISA-18.2 要求穩態下每位操作員 < 6 則/小時
+#（>30 則/小時視為告警洪水），故 5σ 嚴重超標、7σ 才落在合格帶內。
+# 註：起始 8σ 經一個衰減週期 ×0.8=6.4 已低於地板，故實務上是「8σ 跑一個週期後固定在 7σ」——
+# 仍保有約 7 倍的 ARL 靈敏度改善（防末期遲鈍的原始動機），只是不再滑到誤報懸崖。
 CUSUM_H_MULT = 8.0         # 校準後的「起始」門檻倍率：h_start = CUSUM_H_MULT * sigma0
-CUSUM_H_FLOOR_MULT = float(os.environ.get("CUSUM_H_FLOOR_MULT", "5.0"))  # 衰減下限 h_floor = 此值 * sigma0
+CUSUM_H_FLOOR_MULT = float(os.environ.get("CUSUM_H_FLOOR_MULT", "7.0"))  # 衰減下限 h_floor = 此值 * sigma0
 CUSUM_DECAY_FACTOR = 0.8   # 每過一個衰減週期，h *= 此值（幾何衰減）
 # 每這麼多筆「校準後樣本」衰減一次。CUSUM 每輪一筆、每輪 ANOMALY_CHECK_INTERVAL≈30s，
 # 故 70 筆≈35 分；8σ→6.4→5.12→(clamp)5σ 共約 1.75 小時滑到地板。用樣本數而非牆鐘，重放測試才好重現。

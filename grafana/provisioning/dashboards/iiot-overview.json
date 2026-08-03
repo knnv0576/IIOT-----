@@ -1056,7 +1056,7 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT device_id, sensor_id, current_mean AS rms_norm, drift_rate_per_min AS rms_slope_per_min,\n       round((eta_seconds/60)::numeric, 0) AS rul_min, status\nFROM (\n  SELECT DISTINCT ON (device_id, sensor_id)\n    device_id, sensor_id, current_mean, drift_rate_per_min, eta_seconds, status, ts\n  FROM rul_predictions WHERE metric_kind = 'ml_rf'\n  ORDER BY device_id, sensor_id, ts DESC\n) latest\nORDER BY CASE status WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END, rul_min NULLS LAST",
+          "rawSql": "SELECT device_id, sensor_id, current_mean AS rms_norm, drift_rate_per_min AS rms_slope_per_min,\n       round((eta_p10_seconds/60)::numeric, 0) AS \"RUL_P10(悲觀)\",\n       round((eta_seconds/60)::numeric, 0) AS rul_min,\n       round((eta_p90_seconds/60)::numeric, 0) AS \"RUL_P90(樂觀)\", status\nFROM (\n  SELECT DISTINCT ON (device_id, sensor_id)\n    device_id, sensor_id, current_mean, drift_rate_per_min, eta_seconds,\n    eta_p10_seconds, eta_p90_seconds, status, ts\n  FROM rul_predictions WHERE metric_kind = 'ml_rf'\n  ORDER BY device_id, sensor_id, ts DESC\n) latest\nORDER BY CASE status WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END, rul_min NULLS LAST",
           "rawQuery": true
         }
       ]
@@ -1064,8 +1064,8 @@
     {
       "id": 61,
       "type": "timeseries",
-      "title": "振動 ML RUL 倒數趨勢 — $device（三軸，分鐘）",
-      "description": "RandomForest 模型輸出的剩餘壽命隨時間變化；健康時高、劣化時應一路下降。橘線=200分（WARNING）、紅線=60分（CRITICAL）。",
+      "title": "振動 ML RUL 倒數趨勢 + 信賴區間 — $device（X軸，分鐘）",
+      "description": "RandomForest 輸出的剩餘壽命隨時間變化；健康時高、劣化時應一路下降。實線=點估計，虛線=P10(悲觀)/P90(樂觀) 信賴區間（ISO 13381-1 要求預後須附信賴區間）。實測本模型相對誤差 60~70%，區間寬度就是這個不確定性的視覺化——請依 P10 安排保養，不要咬住點估計。橘線=200分(WARNING)、紅線=60分(CRITICAL)。",
       "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "timescaledb"
@@ -1108,7 +1108,50 @@
             ]
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "P10.*|P90.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    6,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "點估計"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.fillBelowTo",
+                "value": "P10(悲觀)"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -1125,7 +1168,7 @@
           "refId": "A",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT ts AS \"time\", eta_seconds/60.0 AS value, sensor_id AS metric\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND eta_seconds IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+          "rawSql": "SELECT ts AS \"time\",\n       eta_p10_seconds/60.0 AS \"P10(悲觀)\",\n       eta_seconds/60.0 AS \"點估計\",\n       eta_p90_seconds/60.0 AS \"P90(樂觀)\"\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND eta_seconds IS NOT NULL\n  AND sensor_id LIKE '%-X'\n  AND $__timeFilter(ts)\nORDER BY ts"
         }
       ]
     },
@@ -1190,6 +1233,371 @@
           "format": "time_series",
           "rawQuery": true,
           "rawSql": "SELECT ts AS \"time\", current_mean AS value, sensor_id AS metric\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND current_mean IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 700,
+      "type": "row",
+      "title": "振動時域跳線（災難兜底：三軸合成 RMS 超過 ISO 危險線就強制 CRITICAL，不看 AI）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "panels": []
+    },
+    {
+      "id": 70,
+      "type": "stat",
+      "title": "跳閘警示盤",
+      "description": "獨立於 SVM/CUSUM 的絕對門檻保險絲：三軸合成 RMS ≥ machine_vibration_thresholds.danger_lower 連續 3 輪（約30秒）就強制 CRITICAL 並閂鎖。閂鎖後即使振動回到正常也維持警示，直到人工確認且條件解除才復歸（ISA-18.2）。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 70
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "✅ 無跳閘",
+                  "color": "green",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS \"閂鎖中機台\" FROM vib_trip_latches",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 71,
+      "type": "table",
+      "title": "跳閘閂鎖明細（未確認的需人工處理）",
+      "description": "確認方式：UPDATE vib_trip_latches SET acknowledged=true, acknowledged_at=now() WHERE device_id='SCT-xx';　確認後仍需振動回到危險線的 90% 以下才會復歸。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 18,
+        "x": 6,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "確認狀態"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "未確認": {
+                        "color": "red",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "已確認（等待復歸）": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*RMS.*|危險線"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "velocitymms"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT device_id AS \"機台\", tripped_at AS \"跳閘時刻\",\n       danger_line AS \"危險線\", peak_mag_rms AS \"峰值RMS\", last_mag_rms AS \"最近RMS\",\n       CASE WHEN acknowledged THEN '已確認（等待復歸）' ELSE '未確認' END AS \"確認狀態\"\nFROM vib_trip_latches\nORDER BY tripped_at DESC",
+          "rawQuery": true
+        }
+      ]
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "三軸合成 RMS vs ISO 危險線 — $device（跳線判定依據）",
+      "description": "跳線實際比較的量：sqrt(rmsX²+rmsY²+rmsZ²)。紅線=該機台 Class 的 ISO 危險線；橘虛線=遲滯復歸線（危險線×90%）。只有跳閘期間才有資料點。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 75
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "velocitymms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "always",
+            "spanNulls": false
+          },
+          "decimals": 3
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "危險線"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "遲滯復歸線"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    5,
+                    5
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "合成RMS"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", current_mean AS \"合成RMS\",\n       target_threshold AS \"危險線\", target_threshold * 0.9 AS \"遲滯復歸線\"\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'vib_trip'\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 73,
+      "type": "table",
+      "title": "跳閘事件歷史（最近 24 小時，全機隊）",
+      "description": "每筆代表跳線判定為 CRITICAL 的一輪。閂鎖期間會持續寫入，所以同一次事件會有多筆連續紀錄。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 75
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "狀態"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "CRITICAL": {
+                        "color": "red",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "合成RMS|危險線"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "velocitymms"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT ts AS \"時間\", device_id AS \"機台\",\n       current_mean AS \"合成RMS\", target_threshold AS \"危險線\", status AS \"狀態\"\nFROM rul_predictions\nWHERE metric_kind = 'vib_trip' AND ts > now() - INTERVAL '24 hours'\nORDER BY ts DESC\nLIMIT 100",
+          "rawQuery": true
         }
       ]
     }
