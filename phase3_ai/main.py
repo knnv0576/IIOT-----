@@ -37,8 +37,8 @@ from anomaly_detector import (
     CusumTracker,
     WINDOW_SAMPLES,
     score_latest_window,
-    train_model,
 )
+from trainer import ensure_model
 
 TIMESCALEDB_DSN = os.environ["TIMESCALEDB_DSN"]
 
@@ -267,32 +267,40 @@ def ensure_cusum_baseline_table(conn) -> None:
         )
 
 
-def load_cusum_baseline(conn, device_id, sensor_id):
-    """回傳 (mu0, sigma0, low_confidence)，沒有持久化基線時回傳 None。"""
+def load_cusum_baseline(conn, device_id, sensor_id, fingerprint):
+    """回傳 (mu0, sigma0, low_confidence)；沒有「同一個模型」的基線時回傳 None。
+
+    **指紋是鍵的一部分,不是附註**：健康分數的分布屬於「機台 × 該次訓練出的模型」。
+    早期版本只用 (device_id, sensor_id) 當鍵，重訓後取到別的模型的基線，實測 sigma0 被低估
+    1.5~3 倍 → slack 與門檻 h 一起縮水 → 健康通道的隨機遊走輕易跨過 h，誤報率一度達 19%。
+    指紋不符就回 None、退回現場暖機——這是正確行為。
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT mu0, sigma0, low_confidence FROM cusum_baselines "
-            "WHERE device_id = %s AND sensor_id = %s",
-            (device_id, sensor_id),
+            "WHERE device_id = %s AND sensor_id = %s AND model_fingerprint = %s",
+            (device_id, sensor_id, fingerprint),
         )
         return cur.fetchone()
 
 
-def save_cusum_baseline(conn, device_id, sensor_id, tracker) -> None:
-    """把現場暖機得到的健康基線 upsert 進 DB，下次重啟即可載回免暖機。"""
+def save_cusum_baseline(conn, device_id, sensor_id, tracker, fingerprint) -> None:
+    """把現場暖機得到的健康基線連同模型指紋存起來，下次同一個模型啟動就能免暖機。"""
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO cusum_baselines
-                (device_id, sensor_id, mu0, sigma0, low_confidence, rejected_frac, n_warmup, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                (device_id, sensor_id, mu0, sigma0, low_confidence, rejected_frac, n_warmup,
+                 model_fingerprint, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (device_id, sensor_id) DO UPDATE SET
                 mu0 = EXCLUDED.mu0, sigma0 = EXCLUDED.sigma0,
                 low_confidence = EXCLUDED.low_confidence, rejected_frac = EXCLUDED.rejected_frac,
-                n_warmup = EXCLUDED.n_warmup, updated_at = now()
+                n_warmup = EXCLUDED.n_warmup, model_fingerprint = EXCLUDED.model_fingerprint,
+                updated_at = now()
             """,
             (device_id, sensor_id, tracker.mu0, tracker.sigma0, tracker.low_confidence,
-             tracker.rejected_frac, CUSUM_WARMUP_SAMPLES),
+             tracker.rejected_frac, CUSUM_WARMUP_SAMPLES, fingerprint),
         )
 
 
@@ -317,6 +325,8 @@ def insert_anomaly_score(conn, device_id, sensor_id, score, is_anomaly, features
 _anomaly_models: dict[tuple[str, str], dict] = {}
 # {(device_id, sensor_id): CusumTracker}；每個通道一個線上 CUSUM 追蹤器，跟模型同時建立。
 _cusum_trackers: dict[tuple[str, str], CusumTracker] = {}
+# {(device_id, sensor_id): 模型指紋}；CUSUM 基線的存取都要帶這個，確保基線與模型是同一組。
+_model_fingerprints: dict[tuple[str, str], str] = {}
 # {(device_id, sensor_id): onset_epoch}；CUSUM 首次警報的時刻，兩段式 RUL 用它當劣化起點錨。
 _rul_onset: dict[tuple[str, str], float] = {}
 # {(device_id, sensor_id): 已記錄的 calib_generation}；每完成一次校準才記/存一次（含重新校準）。
@@ -565,19 +575,33 @@ def run_anomaly_detection_cycle(conn) -> None:
             key = (device_id, sensor_id)
 
             if key not in _anomaly_models:
-                bundle = train_model(conn, device_id, sensor_id, fundamental_hz=fundamental_hz)
-                if bundle is None:
+                # 載入優先、缺少才自動訓練（見 trainer.py）。模型持久化之後，重啟不會重訓，
+                # 分數尺度固定 → CUSUM 基線才可以安全沿用。
+                got = ensure_model(conn, device_id, sensor_id, fundamental_hz, quiet=True)
+                if got is None:
                     continue  # 歷史資料還不夠，下一輪再試
-                _anomaly_models[key] = bundle
+                bundle, fingerprint, source = got
+
                 tracker = CusumTracker()
-                baseline = load_cusum_baseline(conn, device_id, sensor_id)
-                if baseline is not None:  # 有持久化基線 → 載回、跳過現場暖機（進再驗證期）
+                # **基線必須與模型指紋綁定**：健康分數的分布是「機台 × 該次模型」的屬性。
+                # 實測若只用機台當鍵，重訓後取到的舊基線 sigma0 會被低估 1.5~3 倍，
+                # 導致 slack 與門檻一起縮水、健康通道大量誤報。指紋不符就退回現場暖機。
+                baseline = load_cusum_baseline(conn, device_id, sensor_id, fingerprint)
+                if baseline is not None:
                     tracker.load_baseline(baseline[0], baseline[1], baseline[2])
+
+                # 三個 dict 一起登記（放在最後）：中途若拋例外就當這個通道還沒準備好，
+                # 下一輪整段重來。若先登記 _anomaly_models 再失敗，下一輪會跳過這段初始化，
+                # 卻讀不到 tracker 而 KeyError——實測踩過。
+                _anomaly_models[key] = bundle
+                _model_fingerprints[key] = fingerprint
                 _cusum_trackers[key] = tracker
+
                 kind = "電流" if sensor_id.startswith("E") else "振動"
+                action = "載入既有模型" if source == "loaded" else "訓練完成並存檔"
                 print(
-                    f"[ai_service] {device_id}/{sensor_id}（{kind} {fundamental_hz:.0f}Hz）頻譜異常模型訓練完成"
-                    f"（{bundle['n_train_windows']} 個訓練窗口）"
+                    f"[ai_service] {device_id}/{sensor_id}（{kind} {fundamental_hz:.0f}Hz）{action}"
+                    f"（{bundle['n_train_windows']} 個訓練窗口，指紋 {fingerprint}）"
                 )
 
             result = score_latest_window(conn, device_id, sensor_id, _anomaly_models[key])
@@ -612,7 +636,8 @@ def run_anomaly_detection_cycle(conn) -> None:
                         f"建議檢查該通道暖機期是否非穩態；不存檔）"
                     )
                 else:
-                    save_cusum_baseline(conn, device_id, sensor_id, tracker)  # 乾淨校準才存
+                    # 乾淨校準才存，並綁定當前模型指紋
+                    save_cusum_baseline(conn, device_id, sensor_id, tracker, _model_fingerprints[key])
                     print(
                         f"[ai_service] CUSUM 基線已存檔（下次重啟免暖機）: {device_id}/{sensor_id} "
                         f"mu0={tracker.mu0:.3f} sigma0={tracker.sigma0:.3f}"

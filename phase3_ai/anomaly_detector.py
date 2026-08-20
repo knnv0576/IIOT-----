@@ -6,6 +6,7 @@
 但頻譜結構已經開始跑掉的異變更敏感。
 """
 
+import hashlib
 import os
 
 import numpy as np
@@ -89,6 +90,24 @@ def train_model(conn, device_id: str, sensor_id: str, fundamental_hz: float = FU
     return {"model": model, "scaler": scaler, "n_train_windows": len(windows), "fundamental_hz": fundamental_hz}
 
 
+def model_fingerprint(model_bundle: dict) -> str:
+    """算出這個訓練好的模型的指紋，用來當 CUSUM 基線快取鍵的一部分。
+
+    為什麼需要（實測踩到的坑）：健康分數的分布是「機台 × **該次訓練出來的模型**」的屬性，
+    不是機台本身的屬性。原本 cusum_baselines 只用 (device_id, sensor_id) 當鍵，等於快取鍵不完整；
+    而 SVM 每次服務啟動都會重訓，取回的 mu0/sigma0 其實屬於另一個模型——實測 sigma0 被低估
+    1.5~3 倍，導致 slack 與門檻 h 一起縮水，健康通道的隨機遊走輕易跨過 h 而大量誤報。
+    把指紋納入鍵之後，模型不同就不會取到舊基線（自然退回現場暖機，正確行為）；
+    等日後模型本身也持久化了，指紋會相符，基線快取就會自動開始生效，不需要再改這裡。
+    """
+    model, scaler = model_bundle["model"], model_bundle["scaler"]
+    h = hashlib.sha256()
+    for arr in (model.dual_coef_, model.support_vectors_, np.atleast_1d(model.intercept_),
+                scaler.mean_, scaler.scale_):
+        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
+    return h.hexdigest()[:16]
+
+
 def score_latest_window(conn, device_id: str, sensor_id: str, model_bundle: dict):
     """對最新一個窗口的原始資料評分。回傳 (score, is_anomaly, features)，資料不足回傳 None。
     score 是 One-Class SVM 的 decision_function 值，越負代表跟訓練時看過的正常樣子差越多。
@@ -153,7 +172,11 @@ CUSUM_LOWCONF_FLOOR_BUMP = 1.0  # 低信心時把衰減地板抬高這麼多 σ�
 # 基線持久化的載入再驗證：mu0/sigma0 存 DB、重啟載回可免掉每次重啟重新暖機的盲窗。但 SVM 模型
 # 每次啟動都重訓，分數尺度可能微漂移，故載入後先用前幾筆新分數確認與載入基線一致（期間仍照常偵測
 # ＝零盲窗），一致就採用、不一致就丟棄基線改重新暖機（自我修復）。
-CUSUM_REVALIDATE_SAMPLES = 10  # 載入後收集這麼多筆新分數做一致性檢查
+# 再驗證/重新對準的樣本數，取與暖機相同（20）。**不能取小**：重新對準要估的是 mu0，而中位數的
+# 標準誤約 1.25σ/√n——n=10 時約 0.4σ，跟 CUSUM 的 slack(0.5σ) 同一量級，估計誤差本身就會被
+# CUSUM 當成劣化累積成假警（實測 n=10 時健康通道誤報 8%）。n=20 把標準誤壓到約 0.28σ。
+# 注意：拉長不會產生偵測盲窗——再驗證期間照常偵測，只是期間累積的 CUSUM 量會在對準後歸零。
+CUSUM_REVALIDATE_SAMPLES = 20
 CUSUM_REVALIDATE_TOL = 3.0     # 新分數中位數與載入 mu0 相差超過此倍 sigma0 → 判定漂移、改重新暖機
 
 
@@ -255,9 +278,25 @@ class CusumTracker:
         if self._provisional:
             self._reval.append(score)
             if len(self._reval) >= CUSUM_REVALIDATE_SAMPLES:
-                drift = abs(float(np.median(self._reval)) - self.mu0)
+                # 用與 _calibrate 相同的 robust 修剪後再取平均：先 median/MAD 擋掉再驗證期間
+                # 的瞬態，再在乾淨點上取 mean（效率較高），避免瞬態把重新對準的中心帶偏。
+                _w = np.asarray(self._reval, dtype=float)
+                _m = float(np.median(_w))
+                _s = max(1.4826 * float(np.median(np.abs(_w - _m))), CUSUM_SIGMA_FLOOR)
+                _keep = _w[np.abs(_w - _m) <= CUSUM_TRIM_K * _s]
+                med = float(np.mean(_keep)) if len(_keep) >= max(3, len(_w) // 2) else _m
+                drift = abs(med - self.mu0)
                 if drift <= CUSUM_REVALIDATE_TOL * self.sigma0:
-                    self._provisional = False  # 一致，確認採用載入基線
+                    # **保留持久化的 sigma0，但用新樣本重新對準 mu0。**
+                    # 原因（實測踩到）：SVM 每次重訓，分數的「中心」會漂移（實測 0.6~0.9σ），
+                    # 但「離散度」相當穩定。而 CUSUM 的 slack 只有 0.5σ——它天生就是設計來偵測
+                    # 這種量級的持續偏移，所以只要沿用舊 mu0，健康通道就會被自己的基線誤差
+                    # 一路累積成假警（實測 34/180 通道誤報）。再驗證容忍 3σ 是「模型是不是同一
+                    # 個世界」的粗檢查，遠比 CUSUM 的靈敏度鬆，不能當成 mu0 夠準的保證。
+                    # 只重估 mu0 所需樣本遠少於估好 sigma0，故持久化的價值（省下長暖機）仍保留。
+                    self.mu0 = med
+                    self.value = 0.0  # 丟棄再驗證期間用舊 mu0 累積的量
+                    self._provisional = False
                 else:
                     self._warmup = list(self._reval)  # 不一致，退回重新暖機
                     self.mu0 = None

@@ -59,6 +59,12 @@ services:
       - timescaledb
     environment:
       TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:-iiot_password}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
+      MODEL_STORE_DIR: /app/model_store
+    volumes:
+      # 訓練好的頻譜異常模型（每通道一個 SVM）。放 volume 才能跨容器重建保留——
+      # 模型持久化之後重啟不必重訓，分數尺度固定，CUSUM 基線才能安全沿用。
+      # 手動重訓：docker compose run --rm ai_service python trainer.py --all --force
+      - ai_model_store:/app/model_store
     restart: unless-stopped
 
   # Phase 4：Grafana 視覺化戰情室
@@ -82,3 +88,4 @@ services:
 volumes:
   timescaledb_data:
   grafana_data:
+  ai_model_store:  # 訓練好的 SVM 模型（見 ai_service 的 volumes 說明）

@@ -138,10 +138,47 @@ ML RUL 用 `[rms_norm, kurt, crest, slope]` 四特徵餵 **32 顆真實軸承訓
 
 | 檔案 | 職責 |
 |---|---|
-| `main.py` | 推論主迴圈 + 三種 RUL + 異常評分排程 |
+| `main.py` | **推論主迴圈**（不再負責訓練）+ 三種 RUL + 異常評分排程 |
+| `trainer.py` | **獨立訓練模組**：載入優先、缺少才訓練；可單獨用 CLI 執行 |
+| `model_store.py` | **模型儲存層**：存/載/指紋/中繼資料，訓練與推論之間唯一的介面 |
 | `spectral_features.py` | FFT 頻譜特徵（thd_ratio）+ 時域（RMS、kurtosis、crest）；SAMPLE_RATE_HZ=2000 |
-| `anomaly_detector.py` | One-Class SVM 訓練/評分 + CUSUM 追蹤器 |
-| `models/rul_rf.pkl` | 正式服務用的 RandomForest RUL 模型（由 validation/train_save_rf.py 產出） |
+| `anomaly_detector.py` | One-Class SVM 訓練演算法 + CUSUM 追蹤器 |
+| `models/rul_rf.pkl` | image 內建的 RandomForest RUL 模型（由 validation/train_save_rf.py 產出，唯讀） |
+
+### 訓練與推論分離（2026-08）
+
+原本 SVM 在 ai_service 啟動時「順便」訓練，模型只活在記憶體。這造成兩個問題：
+
+1. 每次重啟都要等 300 秒累積資料 + 重訓，期間無法偵測。
+2. **重訓後 decision_function 的分數尺度會變**（實測離散度差 1.5~3 倍），而 CUSUM 基線是
+   「機台 × 該次模型」的屬性 → 模型一換基線就失效 → slack 與門檻一起縮水 → 健康通道大量誤報。
+
+現在改成：
+
+```
+sensor_readings（模擬器 + MQTT 真實資料寫進同一張表）
+      │
+      ▼
+trainer.py ──訓練──> model_store（Docker volume，跨容器重建保留）
+      │                    │
+      │                    ▼
+      └──載入優先────> main.py 推論（重啟不重訓）
+                           │
+                           └─ CUSUM 基線以「模型指紋」為鍵存取，指紋不符就重新暖機
+```
+
+**使用方式**
+
+| 情境 | 指令 |
+|---|---|
+| 自動（預設） | ai_service 發現通道沒有模型且資料足夠 → 自動訓練並存檔 |
+| 查看已存模型 | `docker compose exec ai_service python trainer.py --list` |
+| 全機隊重訓 | `docker compose run --rm ai_service python trainer.py --all --force` |
+| 單台重訓 | `docker compose run --rm ai_service python trainer.py --device SCT-05 --force` |
+
+**接真實感測器時**：訓練讀的是 `sensor_readings`，MQTT 進線寫的也是同一張表，所以真實資料
+一進來就會被自動用於訓練，不需要改程式。但**必須在機台確認健康時**做一次
+`--all --force` 的正式 commissioning 訓練——程式無法自行判斷資料是否代表健康狀態。
 
 ---
 
