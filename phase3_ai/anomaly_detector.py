@@ -61,12 +61,14 @@ def _chunk_windows(series: list[float], window_samples: int) -> list[list[float]
     return [series[i * window_samples : (i + 1) * window_samples] for i in range(n_windows)]
 
 
-def train_model(conn, device_id: str, sensor_id: str, fundamental_hz: float = FUNDAMENTAL_HZ) -> dict | None:
-    """用最近 TRAIN_WINDOW_SECONDS 秒的原始資料訓練一個通道專屬的 One-Class SVM。
-    資料不足時回傳 None（呼叫端應該之後再重試，而不是硬訓練一個不可靠的模型）。
+def extract_training_features(conn, device_id: str, sensor_id: str,
+                              fundamental_hz: float = FUNDAMENTAL_HZ):
+    """從 DB 取最近 TRAIN_WINDOW_SECONDS 秒的原始波形，算出訓練用的特徵矩陣。
+    回傳 shape=(n_windows, n_features) 的 ndarray；資料量或覆蓋度不足時回傳 None。
 
-    fundamental_hz：這個通道的基頻，電流用 60Hz、振動用 30Hz（模擬器 _VIBRATION_FREQ_HZ）。
-    模型 bundle 會把 fundamental_hz 一起存起來，評分時沿用同一個值，確保特徵一致。
+    抽出來當獨立函式的原因：讓「特徵」可以被存檔／版控／事後重現訓練。原始波形在
+    2kHz × 70 感測器下是 ~1GB/5分鐘、保留政策只留 20 分鐘，不可能長期保存；
+    但特徵矩陣整個機隊只有幾百 KB，存得起。見 trainer.py 的 --save-features。
     """
     series = fetch_raw_series(conn, device_id, sensor_id, TRAIN_WINDOW_SECONDS)
     # 覆蓋度檢查：實測發現服務啟動初期，資料剛累積到窗口數下限就搶先訓練的話，
@@ -79,17 +81,39 @@ def train_model(conn, device_id: str, sensor_id: str, fundamental_hz: float = FU
     if len(windows) < MIN_TRAIN_WINDOWS:
         return None
 
-    feature_vectors = np.array(
+    return np.array(
         [to_vector(extract_features(np.array(w), fundamental_hz=fundamental_hz)) for w in windows]
     )
 
+
+def fit_model_from_features(feature_vectors, fundamental_hz: float = FUNDAMENTAL_HZ) -> dict:
+    """由特徵矩陣擬合 One-Class SVM，回傳模型 bundle。
+
+    這一段是純計算、不碰 DB——所以「從存檔的特徵重訓」跟「從即時資料重訓」走的是
+    完全相同的程式碼路徑，結果（含模型指紋）可完全重現。
+    """
+    feature_vectors = np.asarray(feature_vectors, dtype=float)
     scaler = StandardScaler()
     scaled = scaler.fit_transform(feature_vectors)
 
     model = OneClassSVM(kernel="rbf", nu=0.05, gamma=ANOMALY_SVM_GAMMA)
     model.fit(scaled)
 
-    return {"model": model, "scaler": scaler, "n_train_windows": len(windows), "fundamental_hz": fundamental_hz}
+    return {"model": model, "scaler": scaler,
+            "n_train_windows": len(feature_vectors), "fundamental_hz": fundamental_hz}
+
+
+def train_model(conn, device_id: str, sensor_id: str, fundamental_hz: float = FUNDAMENTAL_HZ) -> dict | None:
+    """用最近 TRAIN_WINDOW_SECONDS 秒的原始資料訓練一個通道專屬的 One-Class SVM。
+    資料不足時回傳 None（呼叫端應該之後再重試，而不是硬訓練一個不可靠的模型）。
+
+    fundamental_hz：這個通道的基頻，電流用 60Hz、振動用 30Hz（模擬器 _VIBRATION_FREQ_HZ）。
+    模型 bundle 會把 fundamental_hz 一起存起來，評分時沿用同一個值，確保特徵一致。
+    """
+    feature_vectors = extract_training_features(conn, device_id, sensor_id, fundamental_hz)
+    if feature_vectors is None:
+        return None
+    return fit_model_from_features(feature_vectors, fundamental_hz)
 
 
 def model_fingerprint(model_bundle: dict) -> str:

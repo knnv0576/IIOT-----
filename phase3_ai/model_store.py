@@ -122,6 +122,74 @@ def list_meta() -> list[dict]:
     return out
 
 
+# ── 訓練特徵集的存取（可版控的訓練基線）─────────────────────────────────
+# 為什麼存特徵而不是原始波形：SVM 實際訓練的就是特徵矩陣。原始波形在 2kHz × 70 感測器下
+# 是 ~1GB/5分鐘，且 sensor_readings 只保留 20 分鐘，不可能長期保存；特徵矩陣整個機隊
+# 只有幾百 KB，小到可以進 git 版控。存下來就能「事後完全重現當初的訓練」——同一份特徵
+# 永遠擬合出同一個模型（指紋相同），對稽核與比較很有用。
+# 限制：特徵是用「當時的特徵定義」算的。若日後改了 FEATURE_NAMES 或 SCHEMA_VERSION，
+# 舊的特徵集就作廢（load_features 會擋下來），那時只能靠原始波形快照重算
+# （見 tools/export_baseline_snapshot.py）。
+FEATURESET_MANIFEST = "manifest.json"
+
+
+def save_features(out_dir, device_id: str, sensor_id: str, feature_vectors,
+                  fundamental_hz: float) -> Path:
+    """把一個通道的訓練特徵矩陣存成 .npz。out_dir 由呼叫端指定（通常是可版控的目錄）。"""
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{device_id}_{sensor_id}.npz"
+    np.savez_compressed(
+        path,
+        X=np.asarray(feature_vectors, dtype=np.float64),
+        fundamental_hz=np.float64(fundamental_hz),
+    )
+    return path
+
+
+def write_featureset_manifest(out_dir, extra: dict | None = None) -> Path:
+    """寫整組特徵集的 manifest：記錄特徵定義與版本，載入時用來擋不相容的舊特徵集。"""
+    from spectral_features import FEATURE_NAMES  # 延遲載入，避免模組層級的循環相依
+    d = Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / FEATURESET_MANIFEST
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "feature_names": list(FEATURE_NAMES),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **(extra or {}),
+    }
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def load_features(in_dir, device_id: str, sensor_id: str):
+    """載入一個通道的訓練特徵矩陣，回傳 (X, fundamental_hz)；不存在或不相容回傳 None。
+
+    相容性檢查是刻意嚴格的：特徵定義一旦改變，用舊特徵集訓練出來的模型會學到錯的東西，
+    而且不會有任何明顯症狀——寧可擋下來要求重新產生，也不要靜默地訓練出錯的模型。
+    """
+    d = Path(in_dir)
+    path = d / f"{device_id}_{sensor_id}.npz"
+    if not path.exists():
+        return None
+    mpath = d / FEATURESET_MANIFEST
+    if mpath.exists():
+        try:
+            from spectral_features import FEATURE_NAMES
+            m = json.loads(mpath.read_text(encoding="utf-8"))
+            if (m.get("schema_version") != SCHEMA_VERSION
+                    or list(m.get("feature_names", [])) != list(FEATURE_NAMES)):
+                return None
+        except Exception:
+            return None
+    try:
+        z = np.load(path)
+        return z["X"], float(z["fundamental_hz"])
+    except Exception:
+        return None
+
+
 def delete(device_id: str, sensor_id: str) -> bool:
     """刪掉一個通道的模型（強制重訓用）。"""
     pkl_path, meta_path = _paths(device_id, sensor_id)

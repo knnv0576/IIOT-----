@@ -27,8 +27,7 @@ import sys
 import psycopg2
 
 import model_store
-from anomaly_detector import train_model
-from spectral_features import FUNDAMENTAL_HZ
+from anomaly_detector import extract_training_features, fit_model_from_features
 
 CURRENT_FUNDAMENTAL_HZ = 60.0   # 電流：60Hz 交流電
 VIBRATION_FUNDAMENTAL_HZ = 30.0  # 振動：對應 edge_pipeline/formulas.py 的 _VIBRATION_FREQ_HZ
@@ -48,11 +47,17 @@ def channels_of(device_id: str) -> list[tuple[str, float]]:
 
 
 def ensure_model(conn, device_id: str, sensor_id: str, fundamental_hz: float,
-                 force: bool = False, quiet: bool = False):
+                 force: bool = False, quiet: bool = False,
+                 save_features_dir=None, from_features_dir=None):
     """取得這個通道可用的模型：優先載入既有的，沒有（或 force）才訓練並存檔。
 
     回傳 (bundle, fingerprint, source)，資料不足而無法訓練時回傳 None。
     source 是 'loaded' 或 'trained'，讓呼叫端知道有沒有真的重訓過。
+
+    from_features_dir：改從存檔的特徵集訓練（完全不碰 DB）。用途是「事後重現當初的訓練」——
+        同一份特徵永遠擬合出同一個模型，指紋也會相同。原始資料只保留 20 分鐘，
+        所以要事後重訓就只能靠這個或原始波形快照。
+    save_features_dir：訓練的同時把特徵矩陣存一份，供日後重現用。
     """
     if not force:
         got = model_store.load(device_id, sensor_id)
@@ -60,28 +65,45 @@ def ensure_model(conn, device_id: str, sensor_id: str, fundamental_hz: float,
             bundle, meta = got
             return bundle, meta["fingerprint"], "loaded"
 
-    bundle = train_model(conn, device_id, sensor_id, fundamental_hz=fundamental_hz)
-    if bundle is None:
-        return None  # 歷史資料還不夠（量或覆蓋度不足），呼叫端之後再試
+    if from_features_dir is not None:
+        got = model_store.load_features(from_features_dir, device_id, sensor_id)
+        if got is None:
+            return None  # 特徵集缺這個通道，或特徵定義已變更而不相容
+        X, fh = got
+        bundle = fit_model_from_features(X, fundamental_hz=fh)
+        source_note = "（來源：存檔特徵集）"
+    else:
+        X = extract_training_features(conn, device_id, sensor_id, fundamental_hz)
+        if X is None:
+            return None  # 歷史資料還不夠（量或覆蓋度不足），呼叫端之後再試
+        if save_features_dir is not None:
+            model_store.save_features(save_features_dir, device_id, sensor_id, X, fundamental_hz)
+        bundle = fit_model_from_features(X, fundamental_hz=fundamental_hz)
+        source_note = ""
+
     fingerprint = model_store.save(device_id, sensor_id, bundle)
     if not quiet:
         kind = "電流" if sensor_id.startswith("E") else "振動"
         print(
             f"[trainer] {device_id}/{sensor_id}（{kind} {fundamental_hz:.0f}Hz）訓練完成並存檔"
-            f"（{bundle['n_train_windows']} 個訓練窗口，指紋 {fingerprint}）"
+            f"（{bundle['n_train_windows']} 個訓練窗口，指紋 {fingerprint}）{source_note}"
         )
     return bundle, fingerprint, "trained"
 
 
-def train_all(conn, devices=None, force: bool = False) -> dict:
+def train_all(conn, devices=None, force: bool = False,
+              save_features_dir=None, from_features_dir=None) -> dict:
     """對指定機台（預設全部）的每個通道確保有模型。回傳統計。"""
     stats = {"trained": 0, "loaded": 0, "insufficient": 0}
     for device_id in devices or DEVICES:
         for sensor_id, fundamental_hz in channels_of(device_id):
-            result = ensure_model(conn, device_id, sensor_id, fundamental_hz, force=force)
+            result = ensure_model(conn, device_id, sensor_id, fundamental_hz, force=force,
+                                  save_features_dir=save_features_dir,
+                                  from_features_dir=from_features_dir)
             if result is None:
                 stats["insufficient"] += 1
-                print(f"[trainer] {device_id}/{sensor_id} 資料不足，略過（稍後可再跑一次）")
+                why = "特徵集缺此通道或特徵定義已變更" if from_features_dir else "資料不足"
+                print(f"[trainer] {device_id}/{sensor_id} {why}，略過")
             else:
                 stats[result[2] if result[2] == "loaded" else "trained"] += 1
     return stats
@@ -93,6 +115,12 @@ def main() -> int:
     ap.add_argument("--device", action="append", help="只訓練指定機台（可重複，例：--device SCT-05）")
     ap.add_argument("--force", action="store_true", help="即使已有模型也重新訓練並覆蓋")
     ap.add_argument("--list", action="store_true", help="列出目前已存的模型")
+    ap.add_argument("--save-features", metavar="DIR",
+                    help="訓練的同時把特徵矩陣存到 DIR（整個機隊約數百 KB，可進 git 版控，"
+                         "供日後完全重現這次訓練）")
+    ap.add_argument("--from-features", metavar="DIR",
+                    help="改從 DIR 的存檔特徵集訓練，完全不碰資料庫。用於事後重現當初的訓練"
+                         "（原始資料只保留 20 分鐘，事後無法回溯）")
     args = ap.parse_args()
 
     if args.list:
@@ -108,15 +136,34 @@ def main() -> int:
 
     if not args.all and not args.device:
         ap.error("請指定 --all 或 --device（或用 --list 查看現況）")
+    if args.save_features and args.from_features:
+        ap.error("--save-features 與 --from-features 不能同時使用")
+    if args.from_features and not args.force:
+        # 沒有 --force 的話會先載入既有模型而根本不會走到特徵集，等於這個參數沒作用
+        ap.error("--from-features 需要搭配 --force（否則會直接沿用既有模型）")
 
-    conn = psycopg2.connect(os.environ["TIMESCALEDB_DSN"])
-    conn.autocommit = True
+    # 從特徵集訓練時完全不需要 DB
+    conn = None
+    if not args.from_features:
+        conn = psycopg2.connect(os.environ["TIMESCALEDB_DSN"])
+        conn.autocommit = True
     try:
-        stats = train_all(conn, devices=args.device, force=args.force)
+        stats = train_all(conn, devices=args.device, force=args.force,
+                          save_features_dir=args.save_features,
+                          from_features_dir=args.from_features)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+
+    if args.save_features and stats["trained"]:
+        model_store.write_featureset_manifest(
+            args.save_features,
+            {"devices": args.device or DEVICES, "n_channels": stats["trained"]},
+        )
+        print(f"[trainer] 特徵集已存到 {args.save_features}（含 manifest.json）")
+
     print(f"[trainer] 完成：新訓練 {stats['trained']}、沿用既有 {stats['loaded']}、"
-          f"資料不足 {stats['insufficient']}")
+          f"未完成 {stats['insufficient']}")
     return 1 if stats["insufficient"] and not stats["trained"] else 0
 
 

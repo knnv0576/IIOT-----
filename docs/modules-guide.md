@@ -180,6 +180,36 @@ trainer.py ──訓練──> model_store（Docker volume，跨容器重建保�
 一進來就會被自動用於訓練，不需要改程式。但**必須在機台確認健康時**做一次
 `--all --force` 的正式 commissioning 訓練——程式無法自行判斷資料是否代表健康狀態。
 
+### 重訓用的歷史資料要放哪裡
+
+**關鍵限制**：`sensor_readings` 的保留政策是 **20 分鐘**（2kHz × 70 感測器 ≈ 1 GB/分鐘，
+一天就 1.4 TB）。所以**必須在「機台當下確認健康」時主動存下來，事後無法回溯**。
+
+三個保存層級，按需要選：
+
+| 層級 | 大小 | 能做什麼 | 指令 |
+|---|---|---|---|
+| **不保存** | 0 | 健康時直接重訓（工業實務常用） | `trainer.py --all --force` |
+| **特徵矩陣** | 全機隊約 **420 KB** | 完全重現當初的訓練（指紋一致），可進 git 版控 | `trainer.py --all --force --save-features DIR` |
+| **原始波形** | 全機隊 5 分鐘約 **420 MB**（壓縮後） | 日後改了特徵定義也能重算 | `python tools/export_baseline_snapshot.py --minutes 5 --note "..."` |
+
+**特徵集重現訓練**（實測：指紋完全一致，且不碰 DB、快 75 倍）：
+```bash
+# 存
+docker compose exec ai_service python trainer.py --all --force --save-features /app/model_store/baseline_20260825
+# 事後重現
+docker compose exec ai_service python trainer.py --all --force --from-features /app/model_store/baseline_20260825
+```
+特徵集帶 `manifest.json` 記錄 `schema_version` 與 `feature_names`；若日後特徵定義變更，
+載入時會被擋下（不會靜默訓練出錯的模型），此時只能靠原始波形快照重算。
+
+**原始波形快照**輸出到 `validation/data/baseline_snapshots/<時間戳>/`（已在 `.gitignore` 內），
+含 `manifest.json` 記錄時間範圍、筆數、取樣率與情境註記。工具在**主機端**執行
+（透過 `docker compose exec psql`），主機不需安裝 psycopg2。
+
+**建議做法**：平常什麼都不存，需要重訓時在健康狀態下 `--force`；每次正式 commissioning
+額外存一份特徵集（進 git）+ 一份原始快照（離線保存）。
+
 ---
 
 ## 3. `timescaledb/init.sql` — 時序資料庫（系統的記憶）
