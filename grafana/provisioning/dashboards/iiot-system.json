@@ -1,0 +1,262 @@
+{
+  "id": null,
+  "uid": "iiot-system",
+  "title": "IIoT 戰情室 ⑤ 系統健康監控",
+  "tags": [
+    "iiot",
+    "iiot-tab"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "custom",
+        "label": "機台（區②③明細用）",
+        "query": "SCT-01,SCT-02,SCT-03,SCT-04,SCT-05,SCT-06,SCT-07,SCT-08,SCT-09,SCT-10",
+        "current": {
+          "text": "SCT-01",
+          "value": "SCT-01"
+        },
+        "options": [
+          {
+            "text": "SCT-01",
+            "value": "SCT-01",
+            "selected": true
+          },
+          {
+            "text": "SCT-02",
+            "value": "SCT-02"
+          },
+          {
+            "text": "SCT-03",
+            "value": "SCT-03"
+          },
+          {
+            "text": "SCT-04",
+            "value": "SCT-04"
+          },
+          {
+            "text": "SCT-05",
+            "value": "SCT-05"
+          },
+          {
+            "text": "SCT-06",
+            "value": "SCT-06"
+          },
+          {
+            "text": "SCT-07",
+            "value": "SCT-07"
+          },
+          {
+            "text": "SCT-08",
+            "value": "SCT-08"
+          },
+          {
+            "text": "SCT-09",
+            "value": "SCT-09"
+          },
+          {
+            "text": "SCT-10",
+            "value": "SCT-10"
+          }
+        ]
+      },
+      {
+        "name": "lookback",
+        "type": "custom",
+        "label": "曾觸發回看範圍（區①閃爍）",
+        "description": "狀態矩陣判定「曾經觸發過」要回看多久。超過這個時間沒再觸發，燈號才會自動轉綠。建議設成一個班別的長度。",
+        "query": "1 hour,4 hours,8 hours,24 hours,7 days",
+        "current": {
+          "text": "8 hours",
+          "value": "8 hours"
+        },
+        "options": [
+          {
+            "text": "1 hour",
+            "value": "1 hour"
+          },
+          {
+            "text": "4 hours",
+            "value": "4 hours"
+          },
+          {
+            "text": "8 hours",
+            "value": "8 hours",
+            "selected": true
+          },
+          {
+            "text": "24 hours",
+            "value": "24 hours"
+          },
+          {
+            "text": "7 days",
+            "value": "7 days"
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "",
+      "tags": [
+        "iiot-tab"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": "",
+      "url": ""
+    }
+  ],
+  "panels": [
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "CPU 使用率",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", cpu_percent AS \"CPU%\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "記憶體使用量",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decmbytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", memory_mb AS \"RAM(MB)\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "每秒寫入吞吐量 (TPS)",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", tps AS \"TPS\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "資料庫寫入延遲",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", write_latency_ms AS \"延遲(ms)\" FROM system_health WHERE $__timeFilter(ts) ORDER BY ts"
+        }
+      ]
+    }
+  ]
+}

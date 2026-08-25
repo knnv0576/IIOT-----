@@ -10,6 +10,8 @@ import hashlib
 import os
 
 import numpy as np
+from scipy.stats import norm as _normal
+from scipy.stats import t as _student_t
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
@@ -127,189 +129,167 @@ def score_latest_window(conn, device_id: str, sensor_id: str, model_bundle: dict
     return score, is_anomaly, features
 
 
-# ── 線上 CUSUM 變化點偵測 ─────────────────────────────────────────────
+# ── 線上 CUSUM 變化點偵測（Self-Starting，Hawkins 1987）─────────────────────
 # 動機：固定門檻 -1.0 在 17 顆真實軸承（PHM2012）上誤報離散度收斂不了（0~63%），因為
 # One-Class SVM 分數的絕對值在不同通道間意義不一致。CUSUM 改累積「分數持續系統性下滑」的
 # 部分，對每個通道自己的噪聲水平自適應。跟 RUL 層看均值斜率同哲學：看趨勢/累積偏移，不看瞬時值。
-# 驗證狀態：CUSUM 已在「模擬器漸進劣化」的 SCT-05 端到端實驗中實測有效（見 main.py 說明）；
-# 17 顆 PHM2012 軸承的離線 CUSUM 對照腳本備妥於 validation/phm2012_cusum_validation.py，但尚未實跑。
-CUSUM_WARMUP_SAMPLES = 20  # 模型訓練後，先收集這麼多筆「健康分數」估基準（每輪一筆）才啟動 CUSUM
-CUSUM_SLACK_K = 0.5        # slack = CUSUM_SLACK_K * sigma0，吸收正常隨機波動，只累積系統性劣化
+#
+# ── 為什麼改成 self-starting（2026-08 實測教訓）────────────────────────────
+# 舊版是「固定暖機 20 筆估出 mu0/sigma0 後凍結」的傳統做法，實測會失控：
+#   增量 = mu0 - score - slack，其中 slack = 0.5*sigma0
+#   只要 mu0 估高了超過 slack，這個增量長期為正 → CUSUM 單調累積 → 必定誤報，且不會自我修復
+#   （CUSUM 跨過門檻後不歸零）。實測告警機台數隨時間 1→2→3→4 持續上升。
+# 根因是樣本數：20 筆估均值的 95% 誤差界是 2σ/√20 ≈ 0.45σ，而容錯只有 slack = 0.5σ——
+# **估計誤差幾乎用光整個容錯**。控制圖文獻對此有明確結論：估計參數的管制圖需要數百個
+# Phase I 樣本才穩定（m=50 時 80% 使用者拿到的 ARL 落在 87.6~290.4，名目 200）。
+#
+# Self-starting 的做法（Hawkins & Olwell）不預先估參數，而是把每個新觀測用「它之前所有
+# 觀測」的 running mean/SD 標準化：
+#     T_n = (x_n - x̄_{n-1}) / s_{n-1} * sqrt((n-1)/n)   ~ t(n-2)
+#     U_n = Φ⁻¹( F_{t,n-2}(T_n) )                        ~ N(0,1)  【在製程穩定時嚴格成立】
+# 關鍵性質：U_n 是嚴格的 iid 標準常態，**與未知的 μ、σ 無關**。所以：
+#   - 沒有參數估計誤差，門檻 h 從一開始就有它設計上的 ARL
+#   - 不需要暖機盲窗（第 3 筆就能開始判斷，實務上從第 5 筆起）
+#   - running 統計會跟著緩慢漂移走——真實機台的溫度/負載/磨耗漂移不會再累積成假警
+# 代價：早期樣本少時檢定力較弱；且若劣化在最初幾筆就已存在，會被當成「正常基準」吸收
+#（self-starting 的已知限制，無法避免）。
+CUSUM_SLACK_K = 0.5  # 標準化後的 slack（單位是 σ）。CUSUM 只累積超過這個幅度的系統性下滑。
 
-# 決策門檻 h 改為「隨校準後時間幾何衰減、但有地板」而非固定值。
-# 動機：固定 h=8*sigma0 偏保守，緩慢劣化要拖到接近末期 value 才跨得過去（onset 太晚才亮）；
-# 而且暖機期若碰到吵的一段、sigma0 被高估，h 在絕對值上過大會「永不觸發」（V05-X 就是這樣，
-# 才臨時加了 thd-floor 補丁）。改成 h 從 8*sigma0 起、每過一個衰減週期 *0.8、滑到地板 5*sigma0 就停住。
-# 地板取 7*sigma0 的依據（2026-08 依 ISA-18.2 修正，原本訂 5σ 是錯的）：
-# 偵測力上 3~12σ 都能 17/17 命中，但「誤報率」對 h 極敏感——用 Siegmund 近似（k=0.5），單通道假警
-# 平均間隔 ARL 每降 1σ 約縮 3 倍。原本只看「單通道」ARL 覺得 5σ 還算安靜，但**操作員感受到的是整個
-# 機隊**：60 通道（6/台×10 台）同時跑，機隊告警率 = 單通道率 × 60。用 validation/cusum_false_alarm_replay.py
-# 實測換算：5σ→約 21 則/小時、8σ→約 3 則/小時。ISA-18.2 要求穩態下每位操作員 < 6 則/小時
-#（>30 則/小時視為告警洪水），故 5σ 嚴重超標、7σ 才落在合格帶內。
-# 註：起始 8σ 經一個衰減週期 ×0.8=6.4 已低於地板，故實務上是「8σ 跑一個週期後固定在 7σ」——
-# 仍保有約 7 倍的 ARL 靈敏度改善（防末期遲鈍的原始動機），只是不再滑到誤報懸崖。
-CUSUM_H_MULT = 8.0         # 校準後的「起始」門檻倍率：h_start = CUSUM_H_MULT * sigma0
-CUSUM_H_FLOOR_MULT = float(os.environ.get("CUSUM_H_FLOOR_MULT", "7.0"))  # 衰減下限 h_floor = 此值 * sigma0
-CUSUM_DECAY_FACTOR = 0.8   # 每過一個衰減週期，h *= 此值（幾何衰減）
-# 每這麼多筆「校準後樣本」衰減一次。CUSUM 每輪一筆、每輪 ANOMALY_CHECK_INTERVAL≈30s，
-# 故 70 筆≈35 分；8σ→6.4→5.12→(clamp)5σ 共約 1.75 小時滑到地板。用樣本數而非牆鐘，重放測試才好重現。
-CUSUM_DECAY_PERIOD_SAMPLES = int(os.environ.get("CUSUM_DECAY_PERIOD_SAMPLES", "70"))
-CUSUM_SIGMA_FLOOR = 0.05   # sigma0 下限，避免某通道健康分數過度集中導致 h 太小、CUSUM 過度敏感
+# 決策門檻，單位是「標準化後的 σ」——因為 U_n 已經是 N(0,1)，h 是純數字，不再乘 sigma0。
+# 取 7 的依據（ISA-18.2）：操作員感受到的是整個機隊，機隊告警率 = 單通道率 × 60 通道。
+# k=0.5 時各 h 的理論 ARL（Siegmund 近似）：5σ≈938、6σ≈2573、7σ≈7020、8σ≈19112 樣本。
+# 每筆間隔 30s、60 通道 → 機隊告警率 = 60 / (ARL × 30s)。ISA-18.2 要求穩態 < 6 則/小時：
+#   h=5 → 8.0 則/小時（超標）、h=6 → 2.8、h=7 → 1.0（約 6 倍餘裕）。
+# **與舊版最大的差別**：舊版這個 ARL 是「理論值」，實際因估計誤差而崩到 448；
+# self-starting 讓理論值就是實際值，所以 h=7 是真的 h=7。
+CUSUM_H = float(os.environ.get("CUSUM_H", "7.0"))
 
-# 方案②+① robust 校準參數（見 CusumTracker._calibrate）。動機：20 筆暖機用 mean/std 估基線時，
-# 一顆瞬態離群（負載尖峰、單筆壞值、旁邊機台干擾）就能把 sigma0 灌歪，而 ARL 對 h/σ 指數敏感 →
-# 假警放大約 40 倍（實測，V05-X 永不觸發就是這樣）。改成「先 median/MAD 擋離群、再在乾淨點上用
-# mean/std 取回效率」，並用「mean↔median、std↔MAD 分歧」當校準可信度旗標。
-CUSUM_TRIM_K = 4.0            # 修剪門檻：|x-median| > K*robust_scale 才剔除。取寬鬆值，保護健康分數
-                             # 不對稱的向下深谷、只砍極端瞬態（K 太小會誤砍健康下探 → 反而更會誤報）
-CUSUM_MIN_KEEP = 10          # 修剪後至少留這麼多點才用 mean/std，否則退回 median/MAD
-CUSUM_MIN_KEEP_FRAC = 0.5    # 或至少保留這個比例（兩條件取較大者）
-CUSUM_GATE_SHIFT = 0.5       # 交叉檢查：|mean-median| 超過此倍 robust_scale → 低信心
-CUSUM_GATE_RATIO = 1.5       # 交叉檢查：std/robust_scale 超過此值 → 低信心（重尾/污染）
-CUSUM_GATE_REJECT_FRAC = 0.3 # 交叉檢查：修剪剔除比例超過此值 → 低信心
-CUSUM_LOWCONF_FLOOR_BUMP = 1.0  # 低信心時把衰減地板抬高這麼多 σ（更保守、少誤報）
+# 開始判斷前至少要看過幾筆。理論上第 3 筆（df=1）起 U_n 就已是嚴格 N(0,1)、誤報率受控，
+# 但那時檢定力極低；取 5 是「盡快上線」與「基準不要只靠 2 筆」的折衷（約 2.5 分鐘，
+# 相較舊版 20 筆暖機的 10 分鐘大幅縮短）。
+CUSUM_SELFSTART_MIN_N = int(os.environ.get("CUSUM_SELFSTART_MIN_N", "5"))
 
-# 基線持久化的載入再驗證：mu0/sigma0 存 DB、重啟載回可免掉每次重啟重新暖機的盲窗。但 SVM 模型
-# 每次啟動都重訓，分數尺度可能微漂移，故載入後先用前幾筆新分數確認與載入基線一致（期間仍照常偵測
-# ＝零盲窗），一致就採用、不一致就丟棄基線改重新暖機（自我修復）。
-# 再驗證/重新對準的樣本數，取與暖機相同（20）。**不能取小**：重新對準要估的是 mu0，而中位數的
-# 標準誤約 1.25σ/√n——n=10 時約 0.4σ，跟 CUSUM 的 slack(0.5σ) 同一量級，估計誤差本身就會被
-# CUSUM 當成劣化累積成假警（實測 n=10 時健康通道誤報 8%）。n=20 把標準誤壓到約 0.28σ。
-# 注意：拉長不會產生偵測盲窗——再驗證期間照常偵測，只是期間累積的 CUSUM 量會在對準後歸零。
-CUSUM_REVALIDATE_SAMPLES = 20
-CUSUM_REVALIDATE_TOL = 3.0     # 新分數中位數與載入 mu0 相差超過此倍 sigma0 → 判定漂移、改重新暖機
+# 機率截斷：F_t(T) 逼近 0 或 1 時 Φ⁻¹ 會發散。截到 1e-6 → |U| ≤ 4.75，
+# 順帶得到一個好性質：**任何單一離群分數對 CUSUM 的貢獻上限是 4.75-0.5=4.25 < h=7**，
+# 所以孤立的瞬態不可能單獨觸發告警，至少要連續兩筆。這是刻意保留的抗突波設計。
+CUSUM_P_CLIP = 1e-6
+
+# 相容用：main.py 存 cusum_baselines 時記錄的 n_warmup 欄位。self-starting 沒有暖機期，
+# 這裡就是「開始判斷所需的最少觀測數」。
+CUSUM_WARMUP_SAMPLES = CUSUM_SELFSTART_MIN_N
 
 
 class CusumTracker:
-    """對單一通道的異常分數時序做單邊 CUSUM，偵測「分數持續往下掉」的漸進劣化。
+    """單一通道的 self-starting 單邊 CUSUM，偵測「異常分數持續往下掉」的漸進劣化。
 
-    校準期：模型訓練後先收集 CUSUM_WARMUP_SAMPLES 筆分數（此時資料假設仍健康）估基準
-    mu0/sigma0，再開始累積——這對應離線實驗裡「用沒參與訓練的 held-out 健康資料校準」。
+    對外介面與舊版相同（update / calibrated / mu0 / sigma0 / value / h ...），
+    所以 main.py 不需要改動。內部改用 running 統計量 + t→常態轉換，不再有凍結的基線。
     """
 
     def __init__(self) -> None:
-        self._warmup: list[float] = []
-        self.mu0: float | None = None
-        self.sigma0: float | None = None
-        self.slack: float | None = None
-        self.h: float | None = None          # 目前生效的門檻（會隨時間從 h_start 衰減到 h_floor）
-        self.h_start: float | None = None     # 校準後起始門檻 = CUSUM_H_MULT * sigma0
-        self.h_floor: float | None = None     # 衰減地板 = CUSUM_H_FLOOR_MULT * sigma0
-        self._n: int = 0                      # 校準後已吃進的樣本數，用來算衰減步數
+        # Welford 線上統計：只需 O(1) 記憶體，且數值穩定（不用累加平方和）
+        self._n: int = 0        # 已納入基準的觀測數
+        self._mean: float = 0.0
+        self._m2: float = 0.0   # 離差平方和，變異數 = _m2 / (n-1)
+
         self.value: float = 0.0
-        self.low_confidence: bool = False     # 校準可信度旗標（方案①交叉檢查閘）
-        self.rejected_frac: float = 0.0       # 暖機被 robust 修剪剔除的比例
-        self.source: str = "warmup"           # 校準來源：'warmup'（現場暖機）或 'loaded'（DB 載回）
-        self.calib_generation: int = 0        # 每完成一次校準 +1，供呼叫端偵測「剛校準」事件、只記一次
-        self._provisional: bool = False       # 載入基線後的再驗證期（期間仍偵測、零盲窗）
-        self._reval: list[float] = []         # 再驗證期收集的新分數
-        self.reval_failed: bool = False       # 一次性旗標：載入基線與新模型分數不一致、已改重新暖機
+        self.h: float = CUSUM_H
+        self.slack: float = CUSUM_SLACK_K
+
+        # 告警後凍結基準更新：否則持續的劣化會被 running 統計吸收成「新的正常」，
+        # 導致 CUSUM 自己把警報消掉（self-starting 的標準對策）。回到 value=0 才解凍。
+        self._frozen: bool = False
+
+        # ── 以下欄位純為相容 main.py 既有的記錄/存檔邏輯 ──
+        self.low_confidence: bool = False
+        self.rejected_frac: float = 0.0
+        self.source: str = "self-starting"
+        self.calib_generation: int = 0
+        self.reval_failed: bool = False
+
+    # ── 相容屬性：main.py 會讀這兩個值存進 cusum_baselines 當診斷用 ──
+    @property
+    def mu0(self) -> "float | None":
+        return self._mean if self._n >= 1 else None
+
+    @property
+    def sigma0(self) -> "float | None":
+        if self._n < 2:
+            return None
+        return float(np.sqrt(self._m2 / (self._n - 1)))
 
     @property
     def calibrated(self) -> bool:
-        return self.mu0 is not None
+        """已看過足夠觀測、可以開始判斷。self-starting 下這只需要幾筆，不是 10 分鐘暖機。"""
+        return self._n >= CUSUM_SELFSTART_MIN_N
 
-    def _apply_baseline(self, floor_mult: float) -> None:
-        """由已定好的 mu0/sigma0 推導 slack 與（會衰減的）門檻，並重置 CUSUM 累積與衰減時鐘。"""
-        self.slack = CUSUM_SLACK_K * self.sigma0
-        self.h_start = CUSUM_H_MULT * self.sigma0
-        self.h_floor = min(self.h_start, floor_mult * self.sigma0)  # 地板不超過起始值
-        self.h = self.h_start
-        self._n = 0
-        self.value = 0.0
-        self.calib_generation += 1
+    def _push(self, x: float) -> None:
+        """Welford 線上更新 running mean / 離差平方和。"""
+        self._n += 1
+        delta = x - self._mean
+        self._mean += delta / self._n
+        self._m2 += delta * (x - self._mean)
 
     def load_baseline(self, mu0: float, sigma0: float, low_confidence: bool) -> None:
-        """從持久化的 DB 基線直接校準（跳過現場暖機），進入再驗證期。"""
-        self.mu0 = float(mu0)
-        self.sigma0 = max(float(sigma0), CUSUM_SIGMA_FLOOR)
-        self.low_confidence = bool(low_confidence)
-        floor_mult = CUSUM_H_FLOOR_MULT + (CUSUM_LOWCONF_FLOOR_BUMP if self.low_confidence else 0.0)
-        self._apply_baseline(floor_mult)
-        self.source = "loaded"
-        self._provisional = True
-        self._reval = []
+        """用先前存下的基線當「起始基準」，讓 running 統計不必從零開始。
 
-    def _calibrate(self) -> None:
-        """從暖機 buffer 估健康基線 mu0/sigma0。
-        方案②（robust 修剪→古典估計）：先用 median/MAD 擋掉暖機期的瞬態離群，再在存活的乾淨點上
-        用 mean/std 取回效率。K 取寬鬆值，刻意保護健康分數本身不對稱的向下深谷、只剔除極端瞬態。
-        方案①（交叉檢查閘）：比對 mean↔median、std↔MAD、剔除比例，分歧大就把這條校準標為低信心，
-        並自動把衰減地板抬高一階（更保守），交由呼叫端記錄告警。
+        self-starting 本來就不需要這個；提供它只是為了在「確定同一個模型、且確信那段資料
+        代表健康」時，能少花幾分鐘就達到較好的檢定力。等效樣本數刻意只給
+        CUSUM_SELFSTART_MIN_N（而非原本的暖機筆數），讓後續真實觀測能很快把基準拉回正確位置——
+        載入的值只是起點，不是凍結的真理。這也是它跟舊版最本質的差別。
         """
-        w = np.asarray(self._warmup, dtype=float)
-        med = float(np.median(w))
-        mad_sigma = 1.4826 * float(np.median(np.abs(w - med)))  # MAD 換算成常態等價 σ
-        scale = max(mad_sigma, CUSUM_SIGMA_FLOOR)
-
-        keep = w[np.abs(w - med) <= CUSUM_TRIM_K * scale]
-        min_keep = max(CUSUM_MIN_KEEP, int(CUSUM_MIN_KEEP_FRAC * len(w)))
-        if len(keep) >= min_keep:
-            self.mu0 = float(np.mean(keep))                       # 乾淨點：mean（效率）
-            self.sigma0 = max(float(np.std(keep)), CUSUM_SIGMA_FLOOR)
-        else:
-            # 剔太兇＝污染過重，別硬算古典估計，退回全體的 robust 值
-            self.mu0 = med
-            self.sigma0 = scale
-        self.rejected_frac = 1.0 - len(keep) / len(w)
-
-        # 交叉檢查閘：兩組估計分歧 → 暖機資料不乾淨 → 低信心
-        mean_all, std_all = float(np.mean(w)), float(np.std(w))
-        self.low_confidence = (
-            abs(mean_all - med) > CUSUM_GATE_SHIFT * scale
-            or std_all > CUSUM_GATE_RATIO * scale
-            or self.rejected_frac > CUSUM_GATE_REJECT_FRAC
-        )
-        floor_mult = CUSUM_H_FLOOR_MULT + (CUSUM_LOWCONF_FLOOR_BUMP if self.low_confidence else 0.0)
-        self._apply_baseline(floor_mult)
-        self.source = "warmup"
-        self._provisional = False  # 現場暖機的校準不需再驗證
+        n_eff = max(2, CUSUM_SELFSTART_MIN_N)
+        self._n = n_eff
+        self._mean = float(mu0)
+        s = max(float(sigma0), 1e-9)
+        self._m2 = (s ** 2) * (n_eff - 1)
+        self.value = 0.0
+        self._frozen = False
+        self.low_confidence = bool(low_confidence)
+        self.source = "seeded"
+        self.calib_generation += 1
 
     def update(self, score: float):
-        """吃一筆新分數，回傳 (cusum 值, 是否持續劣化)。校準期間回傳 (None, False)。"""
-        if not self.calibrated:
-            self._warmup.append(score)
-            if len(self._warmup) >= CUSUM_WARMUP_SAMPLES:
-                self._calibrate()
+        """吃一筆新分數，回傳 (cusum 值, 是否持續劣化)；觀測還不夠時回傳 (None, False)。"""
+        x = float(score)
+        n_prev = self._n
+
+        # 需要至少 2 筆先驗觀測才能算 s_{n-1}（自由度 n-2 >= 1）
+        if n_prev < 2:
+            self._push(x)
             return None, False
 
-        # 載入持久化基線後的短暫再驗證：用前幾筆新分數確認與載入基線一致。期間仍照常往下偵測
-        # （零盲窗）；不一致代表模型重訓後分數漂移，丟棄基線改重新暖機（自我修復）。
-        if self._provisional:
-            self._reval.append(score)
-            if len(self._reval) >= CUSUM_REVALIDATE_SAMPLES:
-                # 用與 _calibrate 相同的 robust 修剪後再取平均：先 median/MAD 擋掉再驗證期間
-                # 的瞬態，再在乾淨點上取 mean（效率較高），避免瞬態把重新對準的中心帶偏。
-                _w = np.asarray(self._reval, dtype=float)
-                _m = float(np.median(_w))
-                _s = max(1.4826 * float(np.median(np.abs(_w - _m))), CUSUM_SIGMA_FLOOR)
-                _keep = _w[np.abs(_w - _m) <= CUSUM_TRIM_K * _s]
-                med = float(np.mean(_keep)) if len(_keep) >= max(3, len(_w) // 2) else _m
-                drift = abs(med - self.mu0)
-                if drift <= CUSUM_REVALIDATE_TOL * self.sigma0:
-                    # **保留持久化的 sigma0，但用新樣本重新對準 mu0。**
-                    # 原因（實測踩到）：SVM 每次重訓，分數的「中心」會漂移（實測 0.6~0.9σ），
-                    # 但「離散度」相當穩定。而 CUSUM 的 slack 只有 0.5σ——它天生就是設計來偵測
-                    # 這種量級的持續偏移，所以只要沿用舊 mu0，健康通道就會被自己的基線誤差
-                    # 一路累積成假警（實測 34/180 通道誤報）。再驗證容忍 3σ 是「模型是不是同一
-                    # 個世界」的粗檢查，遠比 CUSUM 的靈敏度鬆，不能當成 mu0 夠準的保證。
-                    # 只重估 mu0 所需樣本遠少於估好 sigma0，故持久化的價值（省下長暖機）仍保留。
-                    self.mu0 = med
-                    self.value = 0.0  # 丟棄再驗證期間用舊 mu0 累積的量
-                    self._provisional = False
-                else:
-                    self._warmup = list(self._reval)  # 不一致，退回重新暖機
-                    self.mu0 = None
-                    self._provisional = False
-                    self.reval_failed = True
-                    return None, False
+        mean_prev = self._mean
+        var_prev = self._m2 / (n_prev - 1)
+        if var_prev <= 0.0:
+            # 退化情形：先前觀測完全相同（例如分數被量化、感測器卡住）。
+            # 無法標準化，先只納入基準，不做判斷。
+            self._push(x)
+            return None, False
+        sd_prev = float(np.sqrt(var_prev))
 
-        # 門檻隨校準後樣本數幾何衰減到地板：h = max(h_floor, h_start * 0.8^steps)。
-        # 讓緩慢劣化的 onset 不會拖到末期才亮，又不低於 h_floor 而讓健康雜訊誤報。
-        self._n += 1
-        steps = self._n // CUSUM_DECAY_PERIOD_SAMPLES
-        self.h = max(self.h_floor, self.h_start * (CUSUM_DECAY_FACTOR ** steps))
+        # Hawkins self-starting 標準化：T ~ t(n_prev - 1)
+        n_now = n_prev + 1
+        t_stat = (x - mean_prev) / sd_prev * float(np.sqrt(n_prev / n_now))
+        df = n_prev - 1
+        p = float(_student_t.cdf(t_stat, df))
+        p = min(max(p, CUSUM_P_CLIP), 1.0 - CUSUM_P_CLIP)
+        u = float(_normal.ppf(p))  # 製程穩定時 u ~ N(0,1)，且與未知的 μ、σ 無關
 
-        # score 越低越異常；(mu0 - score) 在劣化時為正 → 累積，slack 把正常波動漏掉。
-        self.value = max(0.0, self.value + (self.mu0 - score - self.slack))
-        return self.value, self.value > self.h
+        # 告警期間凍結基準（不 _push），避免劣化被當成新的正常而把警報自己消掉
+        if not self._frozen:
+            self._push(x)
+
+        if not self.calibrated:
+            return None, False
+
+        # 單邊 CUSUM：分數越低越異常 → 累積 (-u)，slack 濾掉正常波動
+        self.value = max(0.0, self.value + (-u - self.slack))
+        alarming = self.value > self.h
+
+        if alarming:
+            self._frozen = True
+        elif self.value == 0.0 and self._frozen:
+            self._frozen = False  # 完全回復才解凍，重新讓基準跟著漂移
+
+        return self.value, alarming

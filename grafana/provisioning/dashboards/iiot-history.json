@@ -1,0 +1,279 @@
+{
+  "id": null,
+  "uid": "iiot-history",
+  "title": "IIoT 戰情室 ④ 異常告警歷史",
+  "tags": [
+    "iiot",
+    "iiot-tab"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "custom",
+        "label": "機台（區②③明細用）",
+        "query": "SCT-01,SCT-02,SCT-03,SCT-04,SCT-05,SCT-06,SCT-07,SCT-08,SCT-09,SCT-10",
+        "current": {
+          "text": "SCT-01",
+          "value": "SCT-01"
+        },
+        "options": [
+          {
+            "text": "SCT-01",
+            "value": "SCT-01",
+            "selected": true
+          },
+          {
+            "text": "SCT-02",
+            "value": "SCT-02"
+          },
+          {
+            "text": "SCT-03",
+            "value": "SCT-03"
+          },
+          {
+            "text": "SCT-04",
+            "value": "SCT-04"
+          },
+          {
+            "text": "SCT-05",
+            "value": "SCT-05"
+          },
+          {
+            "text": "SCT-06",
+            "value": "SCT-06"
+          },
+          {
+            "text": "SCT-07",
+            "value": "SCT-07"
+          },
+          {
+            "text": "SCT-08",
+            "value": "SCT-08"
+          },
+          {
+            "text": "SCT-09",
+            "value": "SCT-09"
+          },
+          {
+            "text": "SCT-10",
+            "value": "SCT-10"
+          }
+        ]
+      },
+      {
+        "name": "lookback",
+        "type": "custom",
+        "label": "曾觸發回看範圍（區①閃爍）",
+        "description": "狀態矩陣判定「曾經觸發過」要回看多久。超過這個時間沒再觸發，燈號才會自動轉綠。建議設成一個班別的長度。",
+        "query": "1 hour,4 hours,8 hours,24 hours,7 days",
+        "current": {
+          "text": "8 hours",
+          "value": "8 hours"
+        },
+        "options": [
+          {
+            "text": "1 hour",
+            "value": "1 hour"
+          },
+          {
+            "text": "4 hours",
+            "value": "4 hours"
+          },
+          {
+            "text": "8 hours",
+            "value": "8 hours",
+            "selected": true
+          },
+          {
+            "text": "24 hours",
+            "value": "24 hours"
+          },
+          {
+            "text": "7 days",
+            "value": "7 days"
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "",
+      "tags": [
+        "iiot-tab"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": "",
+      "url": ""
+    }
+  ],
+  "panels": [
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "全機隊告警時間軸（最近 24 小時，每點=一次偵測到異常）",
+      "description": "把各偵測器的告警畫在同一條時間軸上，快速看出「什麼時候、哪一台、哪一種偵測器」在叫。值 2=CRITICAL、1=WARNING。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "max": 3,
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "WARNING",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "2": {
+                  "text": "CRITICAL",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\",\n       CASE status WHEN 'CRITICAL' THEN 2 ELSE 1 END AS value,\n       device_id || ' / ' || CASE metric_kind\n         WHEN 'current_mean' THEN '電流RUL' WHEN 'thd_ratio' THEN '頻譜RUL'\n         WHEN 'ml_rf' THEN 'ML RUL' WHEN 'vib_trip' THEN '時域跳線'\n         ELSE metric_kind END AS metric\nFROM rul_predictions\nWHERE status IN ('WARNING','CRITICAL') AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "type": "table",
+      "title": "異常事件明細（最近 24 小時，全機隊）",
+      "description": "涵蓋全部偵測器。『偵測器』欄可看出是哪一層抓到的：頻譜異常=單一窗口的頻譜結構跑掉；CUSUM 漸進劣化=分數持續系統性下滑（更早、更可靠）；時域跳線=三軸合成 RMS 超過 ISO 危險線，完全不看 AI 的災難兜底。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "偵測器"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "CUSUM 漸進劣化": {
+                        "color": "red",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "頻譜異常(瞬時)": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "時域跳線(CRITICAL)": {
+                        "color": "dark-red",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"時間\", device_id AS \"機台\", sensor_id AS \"感測器\",\n       CASE WHEN COALESCE(cusum_alarm,false) THEN 'CUSUM 漸進劣化' ELSE '頻譜異常(瞬時)' END AS \"偵測器\",\n       'score=' || round(score::numeric,3) || '  thd=' || round(thd_ratio::numeric,5) AS \"數值\"\nFROM anomaly_scores\nWHERE (is_anomaly OR COALESCE(cusum_alarm,false)) AND ts > now() - INTERVAL '24 hours'\nUNION ALL\nSELECT ts, device_id, sensor_id, '時域跳線(CRITICAL)',\n       '合成RMS=' || round(current_mean::numeric,3) || '  危險線=' || round(target_threshold::numeric,2)\nFROM rul_predictions\nWHERE metric_kind = 'vib_trip' AND ts > now() - INTERVAL '24 hours'\nORDER BY 1 DESC\nLIMIT 200"
+        }
+      ]
+    }
+  ]
+}

@@ -586,9 +586,17 @@ def run_anomaly_detection_cycle(conn) -> None:
                 # **基線必須與模型指紋綁定**：健康分數的分布是「機台 × 該次模型」的屬性。
                 # 實測若只用機台當鍵，重訓後取到的舊基線 sigma0 會被低估 1.5~3 倍，
                 # 導致 slack 與門檻一起縮水、健康通道大量誤報。指紋不符就退回現場暖機。
-                baseline = load_cusum_baseline(conn, device_id, sensor_id, fingerprint)
-                if baseline is not None:
-                    tracker.load_baseline(baseline[0], baseline[1], baseline[2])
+                # 跨 session 沿用基線預設關閉（CUSUM_USE_PERSISTED_BASELINE=1 才啟用）。
+                # **實測證據**：即使模型指紋完全相同，上個 session 存的基線對這個 session 的資料
+                # 仍系統性偏差——mu0 高出 0.16~0.39、sigma0 低估 1.5~2.7 倍。因為分數分布不只取決於
+                # 模型，也取決於當下的資料（模擬器重啟、真實機台的溫度/負載/磨耗都會讓分數漂移）。
+                # 後果是 (mu0 - score - slack) 每一筆都為正 → CUSUM 單調累積 → **所有通道遲早都會
+                # 誤報**，實測告警機台數隨時間 1→2→3→4 持續上升。凍結的基線本質上就是錯的。
+                # 現在一律現場暖機（20 筆≈10 分鐘），這是唯一能保證基線對應當下資料的做法。
+                if os.environ.get("CUSUM_USE_PERSISTED_BASELINE", "0") == "1":
+                    baseline = load_cusum_baseline(conn, device_id, sensor_id, fingerprint)
+                    if baseline is not None:
+                        tracker.load_baseline(baseline[0], baseline[1], baseline[2])
 
                 # 三個 dict 一起登記（放在最後）：中途若拋例外就當這個通道還沒準備好，
                 # 下一輪整段重來。若先登記 _anomaly_models 再失敗，下一輪會跳過這段初始化，

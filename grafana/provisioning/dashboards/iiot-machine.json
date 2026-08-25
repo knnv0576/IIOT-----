@@ -1,0 +1,429 @@
+{
+  "id": null,
+  "uid": "iiot-machine",
+  "title": "IIoT 戰情室 ② 機台現況",
+  "tags": [
+    "iiot",
+    "iiot-tab"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "custom",
+        "label": "機台（區②③明細用）",
+        "query": "SCT-01,SCT-02,SCT-03,SCT-04,SCT-05,SCT-06,SCT-07,SCT-08,SCT-09,SCT-10",
+        "current": {
+          "text": "SCT-01",
+          "value": "SCT-01"
+        },
+        "options": [
+          {
+            "text": "SCT-01",
+            "value": "SCT-01",
+            "selected": true
+          },
+          {
+            "text": "SCT-02",
+            "value": "SCT-02"
+          },
+          {
+            "text": "SCT-03",
+            "value": "SCT-03"
+          },
+          {
+            "text": "SCT-04",
+            "value": "SCT-04"
+          },
+          {
+            "text": "SCT-05",
+            "value": "SCT-05"
+          },
+          {
+            "text": "SCT-06",
+            "value": "SCT-06"
+          },
+          {
+            "text": "SCT-07",
+            "value": "SCT-07"
+          },
+          {
+            "text": "SCT-08",
+            "value": "SCT-08"
+          },
+          {
+            "text": "SCT-09",
+            "value": "SCT-09"
+          },
+          {
+            "text": "SCT-10",
+            "value": "SCT-10"
+          }
+        ]
+      },
+      {
+        "name": "lookback",
+        "type": "custom",
+        "label": "曾觸發回看範圍（區①閃爍）",
+        "description": "狀態矩陣判定「曾經觸發過」要回看多久。超過這個時間沒再觸發，燈號才會自動轉綠。建議設成一個班別的長度。",
+        "query": "1 hour,4 hours,8 hours,24 hours,7 days",
+        "current": {
+          "text": "8 hours",
+          "value": "8 hours"
+        },
+        "options": [
+          {
+            "text": "1 hour",
+            "value": "1 hour"
+          },
+          {
+            "text": "4 hours",
+            "value": "4 hours"
+          },
+          {
+            "text": "8 hours",
+            "value": "8 hours",
+            "selected": true
+          },
+          {
+            "text": "24 hours",
+            "value": "24 hours"
+          },
+          {
+            "text": "7 days",
+            "value": "7 days"
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "",
+      "tags": [
+        "iiot-tab"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": "",
+      "url": ""
+    }
+  ],
+  "panels": [
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "溫度 — $device",
+      "description": "自然漂移應落在 25.5~26.5°C。紅虛線為上下限。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 25.5
+              },
+              {
+                "color": "red",
+                "value": 26.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", value AS \"溫度\"\nFROM sensor_readings\nWHERE device_id = '$device'\n  AND sensor_id = 'T' || (split_part('$device','-',2))::int::text\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "電流三相 (A/B/C) — $device",
+      "description": "1 秒彙總後 60Hz 正弦波已被平均抵消，三相看起來接近是正常現象。紅虛線=電流 RUL 追蹤的上下限 5.5% / 6.5%。圖例可點擊單獨顯示某一相。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "min",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 5.5
+              },
+              {
+                "color": "red",
+                "value": 6.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT bucket AS \"time\", sensor_id AS \"metric\", avg_value AS value\nFROM current_1s_agg\nWHERE device_id = '$device' AND $__timeFilter(bucket)\nORDER BY bucket"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "三軸合成振動 vs ISO 門檻 — $device",
+      "description": "綠=優良上限、黃=可接受上限、紅=危險門檻（依機台 Class 自動對應：I=4.5、II=7.1、III=11.2 mm/s）。合成振動碰到紅線就會觸發時域跳線強制 CRITICAL。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "velocitymms",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "優良上限"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "可接受上限"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "危險門檻"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "合成振動"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  v.bucket AS \"time\",\n  sqrt(v.x*v.x + v.y*v.y + v.z*v.z) AS \"合成振動\",\n  t.good_upper AS \"優良上限\",\n  t.acceptable_upper AS \"可接受上限\",\n  t.danger_lower AS \"危險門檻\"\nFROM vibration_1s_agg v\nCROSS JOIN (\n  SELECT good_upper, acceptable_upper, danger_lower\n  FROM machine_vibration_thresholds WHERE device_id = '$device'\n) t\nWHERE v.device_id = '$device' AND $__timeFilter(v.bucket)\nORDER BY v.bucket"
+        }
+      ]
+    }
+  ]
+}

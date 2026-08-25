@@ -1,0 +1,510 @@
+{
+  "id": null,
+  "uid": "iiot-predict",
+  "title": "IIoT 戰情室 ③ 早期預警與剩餘壽命",
+  "tags": [
+    "iiot",
+    "iiot-tab"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "custom",
+        "label": "機台（區②③明細用）",
+        "query": "SCT-01,SCT-02,SCT-03,SCT-04,SCT-05,SCT-06,SCT-07,SCT-08,SCT-09,SCT-10",
+        "current": {
+          "text": "SCT-01",
+          "value": "SCT-01"
+        },
+        "options": [
+          {
+            "text": "SCT-01",
+            "value": "SCT-01",
+            "selected": true
+          },
+          {
+            "text": "SCT-02",
+            "value": "SCT-02"
+          },
+          {
+            "text": "SCT-03",
+            "value": "SCT-03"
+          },
+          {
+            "text": "SCT-04",
+            "value": "SCT-04"
+          },
+          {
+            "text": "SCT-05",
+            "value": "SCT-05"
+          },
+          {
+            "text": "SCT-06",
+            "value": "SCT-06"
+          },
+          {
+            "text": "SCT-07",
+            "value": "SCT-07"
+          },
+          {
+            "text": "SCT-08",
+            "value": "SCT-08"
+          },
+          {
+            "text": "SCT-09",
+            "value": "SCT-09"
+          },
+          {
+            "text": "SCT-10",
+            "value": "SCT-10"
+          }
+        ]
+      },
+      {
+        "name": "lookback",
+        "type": "custom",
+        "label": "曾觸發回看範圍（區①閃爍）",
+        "description": "狀態矩陣判定「曾經觸發過」要回看多久。超過這個時間沒再觸發，燈號才會自動轉綠。建議設成一個班別的長度。",
+        "query": "1 hour,4 hours,8 hours,24 hours,7 days",
+        "current": {
+          "text": "8 hours",
+          "value": "8 hours"
+        },
+        "options": [
+          {
+            "text": "1 hour",
+            "value": "1 hour"
+          },
+          {
+            "text": "4 hours",
+            "value": "4 hours"
+          },
+          {
+            "text": "8 hours",
+            "value": "8 hours",
+            "selected": true
+          },
+          {
+            "text": "24 hours",
+            "value": "24 hours"
+          },
+          {
+            "text": "7 days",
+            "value": "7 days"
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "",
+      "tags": [
+        "iiot-tab"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": "",
+      "url": ""
+    }
+  ],
+  "panels": [
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "頻譜劣化 thd_ratio — $device（三軸）",
+      "description": "諧波/基頻能量比。真實軸承早期故障會先在頻譜出現邊帶，此值上升時整體振幅往往還沒動——這是比區②更早的預警。紅線=劣化門檻 0.05（健康約 0.005）。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 5,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", thd_ratio AS value, sensor_id AS metric\nFROM anomaly_scores\nWHERE device_id = '$device' AND sensor_id LIKE 'V%' AND thd_ratio IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "CUSUM 漸進劣化累積 — $device（三軸）",
+      "description": "累積「異常分數持續系統性下滑」的量，而非看瞬時值是否低於某條線。持續走高代表偵測到漸進劣化。跨資料集驗證 32/32 真實軸承全命中。決策門檻 h 會從 8σ 衰減到 7σ 地板（依 ISA-18.2 告警率訂）。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", cusum AS value, sensor_id AS metric\nFROM anomaly_scores\nWHERE device_id = '$device' AND sensor_id LIKE 'V%' AND cusum IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "振動 ML 剩餘壽命 + 信賴區間 — $device（X 軸）",
+      "description": "RandomForest（32 顆真實軸承訓練、跨 IMS 泛化驗證）輸出的剩餘壽命。實線=點估計，虛線=P10(悲觀)/P90(樂觀) 信賴區間（ISO 13381-1 要求預後須附信賴區間）。實測相對誤差 60~70%，區間寬度就是這個不確定性——請依 P10 安排保養，不要咬住點估計。橘線=200分(WARNING)、紅線=60分(CRITICAL)。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 6,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 200
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "P10.*|P90.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    6,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "點估計"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.fillBelowTo",
+                "value": "P10(悲觀)"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\",\n       eta_p10_seconds/60.0 AS \"P10(悲觀)\",\n       eta_seconds/60.0 AS \"點估計\",\n       eta_p90_seconds/60.0 AS \"P90(樂觀)\"\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND eta_seconds IS NOT NULL\n  AND sensor_id LIKE '%-X'\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "振動 rms_norm（現值 / 健康基線）— $device（三軸）",
+      "description": "ML RUL 最重要的輸入特徵（重要度 57%）。1.0=與健康基線相同；真實軸承磨損末期可達 6~10 倍。持續走高代表振幅型劣化正在發生。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT ts AS \"time\", current_mean AS value, sensor_id AS metric\nFROM rul_predictions\nWHERE device_id = '$device' AND metric_kind = 'ml_rf' AND current_mean IS NOT NULL\n  AND $__timeFilter(ts)\nORDER BY ts"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "table",
+      "title": "三種 RUL 預測總表（全機隊，依緊急程度排序）",
+      "description": "電流均值 RUL＝追蹤電流均值撞上下限；頻譜 RUL＝追蹤 thd_ratio 撞 0.05；ML RUL＝RandomForest 直接輸出剩餘分鐘（附 P10/P90 信賴區間）。三者互補：前兩者是趨勢外推，ML 是從真實軸承學來的。",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "timescaledb"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "狀態"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "STABLE": {
+                        "color": "green",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "WARNING": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "value",
+                    "options": {
+                      "CRITICAL": {
+                        "color": "red",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "剩餘.*|P10.*|P90.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "m"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  CASE metric_kind WHEN 'current_mean' THEN '電流均值 RUL'\n                   WHEN 'thd_ratio'    THEN '頻譜 RUL'\n                   WHEN 'ml_rf'        THEN 'ML RUL (RF)'\n                   ELSE metric_kind END AS \"預測種類\",\n  device_id AS \"機台\", sensor_id AS \"感測器\",\n  round(current_mean::numeric, 4) AS \"追蹤量現值\",\n  round((eta_p10_seconds/60)::numeric, 0) AS \"P10(悲觀)\",\n  round((eta_seconds/60)::numeric, 0) AS \"剩餘(分)\",\n  round((eta_p90_seconds/60)::numeric, 0) AS \"P90(樂觀)\",\n  status AS \"狀態\"\nFROM (\n  SELECT DISTINCT ON (device_id, sensor_id, metric_kind)\n    device_id, sensor_id, metric_kind, current_mean, eta_seconds,\n    eta_p10_seconds, eta_p90_seconds, status, ts\n  FROM rul_predictions\n  WHERE metric_kind IN ('current_mean','thd_ratio','ml_rf')\n    AND ts > now() - INTERVAL '5 minutes'\n  ORDER BY device_id, sensor_id, metric_kind, ts DESC\n) latest\nORDER BY CASE status WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END,\n         eta_seconds NULLS LAST"
+        }
+      ]
+    }
+  ]
+}
