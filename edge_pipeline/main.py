@@ -11,10 +11,12 @@
 兩者共用同一份 danger_flags，切換效果一樣，可以同時開著互不干擾。
 """
 
+import hmac
 import json
 import multiprocessing as mp
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -35,9 +37,18 @@ from records import explode_batch_raw
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "mosquitto")  # MQTT broker 的主機名稱
 MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))  # MQTT broker 的連接埠
 MQTT_TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "iiot")  # 訂閱主題的前綴，實際訂閱 "<prefix>/#"
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME") or None  # broker 帳密（mosquitto 已禁止匿名連線）
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or None
+# MQTT 進線佇列上限：外部裝置灌爆訊息時，寧可丟掉新訊息（mqtt_ingest 會印 log），
+# 也不要讓沒有上限的 queue 把記憶體吃光、拖垮整個 edge_pipeline。
+MQTT_QUEUE_MAXSIZE = int(os.environ.get("MQTT_QUEUE_MAXSIZE", "100000"))
 
 # --- 危險模式控制 HTTP API 設定 ---
 HTTP_CONTROL_PORT = int(os.environ.get("HTTP_CONTROL_PORT", "8080"))
+# POST 類操作（切換危險模式、劣化注入、/quit）必須帶 "Authorization: Bearer <token>"。
+# 沒設定 token 時 POST 一律拒絕（fail-closed），不會變成「任何人都能操作」。
+# GET /status 只回傳狀態、不改任何東西，維持免驗證，方便監控。
+CONTROL_API_TOKEN = os.environ.get("CONTROL_API_TOKEN", "")
 
 # --- TimescaleDB 連線與批次寫入設定 ---
 TIMESCALEDB_DSN = os.environ["TIMESCALEDB_DSN"]  # postgresql://user:password@host:port/dbname，必須由外部提供
@@ -155,56 +166,88 @@ def db_writer_loop(
         stop_event: 全域停止旗標，設定後這條迴圈會結束並做善後（flush 剩餘資料、關閉連線）。
         report_interval: 每隔幾秒印一次「過去 N 秒寫入了幾筆」的統計訊息。
     """
-    conn = db_writer.connect(TIMESCALEDB_DSN)
+    # 連線一律走 ensure_connection()，不在這裡直接 connect()：docker compose 的 depends_on
+    # 只保證 timescaledb 容器「已啟動」、不保證資料庫「已可連線」（第一次 up 時 init.sql 要跑好幾秒）。
+    # 舊版在這裡直接 connect()，一失敗整條 thread 就死掉，主進程卻還活著、容器不會重啟——
+    # 結果是這幾台機台的 Queue 沒人抽、模擬器被背壓卡死，表面上卻一切正常。
+    conn = None
     buffer: list[tuple] = []  # 本地緩衝，累積尚未寫進資料庫的 (ts, device_id, sensor_id, value) tuple
     last_flush = time.time()  # 上一次呼叫 flush() 的時間，用來判斷 DB_BATCH_SECONDS 是否已到
     last_report = time.time()  # 上一次印出吞吐量統計的時間
     written_since_report = 0  # 距離上次印出統計以來，實際成功寫入資料庫的筆數
-    connection_ok = True  # 目前資料庫連線是否正常；False 代表正在斷線重連的冷卻期
-    last_reconnect_attempt = 0.0  # 上一次嘗試重新連線的時間戳，用來計算 RECONNECT_COOLDOWN
+    connection_ok = False  # 目前資料庫連線是否正常；False 代表尚未連上或正在斷線重連
+    last_reconnect_attempt = 0.0  # 上一次嘗試連線的時間戳，用來計算 RECONNECT_COOLDOWN
+    ever_connected = False  # 只用來決定 log 要寫「連線成功」還是「重新連線成功」
+
+    def ensure_connection() -> bool:
+        """確保有可用連線；沒有就嘗試（重新）連線，並遵守 RECONNECT_COOLDOWN 避免瘋狂重試。"""
+        nonlocal conn, connection_ok, last_reconnect_attempt, ever_connected
+        if connection_ok:
+            return True
+        now = time.time()
+        if now - last_reconnect_attempt < RECONNECT_COOLDOWN:
+            return False  # 還在冷卻時間內，資料留在 buffer 裡等下一輪再嘗試
+        last_reconnect_attempt = now
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+        try:
+            conn = db_writer.connect(TIMESCALEDB_DSN)
+        except psycopg2.Error as exc:
+            print(
+                f"[db_writer-{writer_id}] 資料庫連線失敗（{exc.__class__.__name__}），"
+                f"{RECONNECT_COOLDOWN:.0f} 秒後再試"
+            )
+            return False
+        connection_ok = True
+        print(
+            f"[db_writer-{writer_id}] "
+            + ("重新連線成功，繼續補寫累積的資料" if ever_connected else "資料庫連線成功")
+        )
+        ever_connected = True
+        return True
 
     def flush():
         """把 buffer 裡目前累積的資料整批寫入資料庫；失敗的話保留資料並嘗試重連，不拋出例外。"""
-        nonlocal conn, last_flush, written_since_report, connection_ok, last_reconnect_attempt
+        nonlocal last_flush, written_since_report, connection_ok
         if not buffer:
             last_flush = time.time()
             return
 
-        now = time.time()
-        if not connection_ok and (now - last_reconnect_attempt) < RECONNECT_COOLDOWN:
-            return  # 還在冷卻時間內，先不重試，資料留在 buffer 裡等下一輪再嘗試
+        if not ensure_connection():
+            return
 
         try:
             t0 = time.perf_counter()
-            db_writer.insert_rows(conn, buffer)
+            # 遇到「資料本身有問題」的批次時，壞的那幾筆會被剔除回傳、其餘照寫——
+            # 不能整批保留重試，否則同一筆壞資料會讓這條 thread 永遠卡在重試迴圈裡。
+            rejected = db_writer.insert_rows_isolating_bad(conn, buffer)
             latency_ms = (time.perf_counter() - t0) * 1000
-            _record_write_stats(len(buffer), latency_ms)  # 回報給 Phase4 系統健康監控
-            written_since_report += len(buffer)
+            n_written = len(buffer) - len(rejected)
+            _record_write_stats(n_written, latency_ms)  # 回報給 Phase4 系統健康監控
+            written_since_report += n_written
             buffer.clear()
-            connection_ok = True
+            if rejected:
+                sample = ", ".join(repr(r) for r in rejected[:3])
+                print(
+                    f"[db_writer-{writer_id}] 剔除 {len(rejected)} 筆資料庫拒收的資料"
+                    f"（資料格式/數值不合法，重試也不會成功），例如：{sample}"
+                )
         except psycopg2.Error as exc:
             # 寫入失敗（最常見原因：資料庫斷線/重啟中）。不重新拋出例外，
             # 避免這條 thread 因為未捕捉的例外而永久死掉、之後再也沒人抽這幾台機台的 Queue。
+            # 下一次 flush() 會透過 ensure_connection() 重連。
             print(
                 f"[db_writer-{writer_id}] 寫入失敗（{exc.__class__.__name__}），"
                 f"保留 {len(buffer)} 筆待重試，嘗試重新連線..."
             )
             connection_ok = False
-            last_reconnect_attempt = now
-            try:
-                conn.close()
-            except Exception:
-                pass
-            try:
-                conn = db_writer.connect(TIMESCALEDB_DSN)
-                connection_ok = True
-                print(f"[db_writer-{writer_id}] 重新連線成功，繼續補寫累積的資料")
-            except psycopg2.Error as reconnect_exc:
-                print(
-                    f"[db_writer-{writer_id}] 重新連線失敗（{reconnect_exc.__class__.__name__}），"
-                    f"{RECONNECT_COOLDOWN:.0f} 秒後再試"
-                )
         last_flush = time.time()
+
+    ensure_connection()  # 先試一次；失敗也沒關係，之後每次 flush() 都會再試
 
     try:
         while not stop_event.is_set():
@@ -256,19 +299,24 @@ def db_writer_loop(
             pass
 
 
-def process_monitor_loop(processes: list, stop_event, check_interval: float = 2.0):
-    """背景健康檢查：定期確認 10 台機台的進程是不是還活著。
+def process_monitor_loop(processes: list, stop_event, check_interval: float = 2.0, writer_threads=None):
+    """背景健康檢查：定期確認 10 台機台的進程、以及各條資料庫寫入 thread 是不是還活著。
 
     死掉的機台只會印出一次警示（機台編號、PID、結束代碼），不會自動重啟——
     自動重啟牽涉到要重建該機台的 Queue、danger_flag，並讓對應的 db_writer thread
     重新指到新的 Queue 上，複雜度較高，這裡先用警示訊息讓人工決定要不要處理。
 
+    寫入 thread 正常情況下不會死（連線錯誤、壞資料都在 db_writer_loop 內部處理掉了），
+    真的死了代表遇到程式 bug——它負責的機台會因為 Queue 沒人抽而被背壓卡住，
+    外表看起來卻一切正常，所以一樣要警示出來。
+
     參數：
         processes: build_workers() 回傳的 10 個 Process 物件清單。
         stop_event: 全域停止旗標，設定後這個檢查迴圈就會結束。
         check_interval: 每隔幾秒檢查一次。
+        writer_threads: db_writer_loop 的 threading.Thread 清單（可省略）。
     """
-    known_dead: set[str] = set()  # 已經警示過的機台編號，避免同一台機台重複洗版
+    known_dead: set[str] = set()  # 已經警示過的機台編號/thread 名稱，避免重複洗版
     while not stop_event.is_set():
         for process in processes:
             if not process.is_alive() and process.name not in known_dead:
@@ -277,7 +325,14 @@ def process_monitor_loop(processes: list, stop_event, check_interval: float = 2.
                     f"[process_monitor] 警示：機台 {process.name} 的進程已停止運作"
                     f"（PID={process.pid}, exitcode={process.exitcode}），不會自動重啟，需要人工檢查"
                 )
-        time.sleep(check_interval)
+        for thread in writer_threads or ():
+            if not thread.is_alive() and thread.name not in known_dead and not stop_event.is_set():
+                known_dead.add(thread.name)
+                print(
+                    f"[process_monitor] 警示：資料庫寫入 thread {thread.name} 已意外結束"
+                    f"（上方應有 traceback），它負責的機台資料不會再寫入，需要人工檢查/重啟服務"
+                )
+        stop_event.wait(check_interval)
 
 
 def system_health_loop(stop_event, interval: float = 2.0):
@@ -360,12 +415,18 @@ def control_loop(danger_flags: dict, stop_event):
         STATUS          印出所有機台目前是正常還是危險模式
         QUIT            設定 stop_event，結束整個程式
 
+    這個函式跑在背景 thread（見 main()）：`for line in sys.stdin` 會一直阻塞到下一行輸入，
+    如果放在主執行緒，HTTP 的 POST /quit 設了 stop_event 主執行緒也醒不過來、程式不會結束。
+    stdin 遇到 EOF（例如容器沒開 stdin）只代表命令列介面不能用，系統照常運作。
+
     參數：
         danger_flags: build_workers() 回傳的 {device_id: multiprocessing.Value} 對照表。
         stop_event: 全域停止旗標，收到 QUIT 指令時會被設定。
     """
     print("輸入指令切換危險模式，例如: SCT-05 DANGER / SCT-05 NORMAL / STATUS / QUIT")
     for line in sys.stdin:
+        if stop_event.is_set():
+            break
         parts = line.strip().split()
         if not parts:
             continue
@@ -386,13 +447,24 @@ def control_loop(danger_flags: dict, stop_event):
         print(f"{device_id} -> {mode}")
 
 
-def _make_control_request_handler(danger_flags: dict, degrade_flags: dict, stop_event):
+def _make_control_request_handler(danger_flags: dict, degrade_flags: dict, stop_event, token: str = ""):
     """建立一個綁定了 danger_flags/degrade_flags/stop_event 的 HTTP handler 類別。
 
     用 closure 把共享狀態帶進去，是因為 BaseHTTPRequestHandler 的子類別
     是由 HTTPServer 自己在每次請求時 instantiate，沒辦法直接在建構子塞自訂參數，
     所以改成用外層函式包一層，讓內層類別透過 closure 拿到需要的共享狀態。
+
+    token：POST 類操作要求的 Bearer token；空字串代表沒設定，POST 一律拒絕。
     """
+
+    def _authorized(header_value: "str | None") -> bool:
+        if not token:
+            return False
+        scheme, _, presented = (header_value or "").partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        # compare_digest：比對時間不隨「前幾個字元對不對」而變，避免被逐字元猜出 token
+        return hmac.compare_digest(presented.strip().encode("utf-8"), token.encode("utf-8"))
 
     class ControlRequestHandler(BaseHTTPRequestHandler):
         def _send_json(self, status_code: int, payload: dict) -> None:
@@ -420,7 +492,22 @@ def _make_control_request_handler(danger_flags: dict, degrade_flags: dict, stop_
             # POST /danger/SCT-05  -> 切成危險模式（瞬間拉高振幅）
             # POST /degrade/SCT-05 -> 觸發漸進劣化（頻譜諧波隨時間成長，供 AI 驗證用）
             # POST /normal/SCT-05  -> 切回正常（同時解除危險模式與漸進劣化）
-            # POST /quit           -> 結束整個程式（等同下 QUIT 指令）
+            # POST /quit           -> 結束整個程式（等同下 QUIT 指令；compose 底下會被自動重啟）
+            # 以上都必須帶 Authorization: Bearer <CONTROL_API_TOKEN>
+            if not token:
+                self._send_json(403, {"error": "控制 API 未設定 CONTROL_API_TOKEN，POST 操作已停用"})
+                return
+            if not _authorized(self.headers.get("Authorization")):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Bearer")
+                body = json.dumps({"error": "未授權：需要 Authorization: Bearer <CONTROL_API_TOKEN>"},
+                                  ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if self.path == "/quit":
                 stop_event.set()
                 self._send_json(200, {"status": "stopping"})
@@ -460,12 +547,13 @@ def http_control_loop(danger_flags: dict, degrade_flags: dict, stop_event, port:
         POST /normal/<device_id>   解除該機台的危險模式與漸進劣化
         POST /quit                 結束整個程式
     """
-    handler_cls = _make_control_request_handler(danger_flags, degrade_flags, stop_event)
+    handler_cls = _make_control_request_handler(danger_flags, degrade_flags, stop_event, CONTROL_API_TOKEN)
     server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
     server.timeout = 0.5  # 讓 handle_request() 最多等 0.5 秒就回來，才能定期檢查 stop_event
+    auth_note = "POST 需 Bearer token" if CONTROL_API_TOKEN else "未設定 CONTROL_API_TOKEN，POST 操作停用"
     print(
         f"[http_control] 控制 API 啟動於 0.0.0.0:{port}"
-        f"（GET /status, POST /danger|degrade|normal/<device>）"
+        f"（GET /status, POST /danger|degrade|normal/<device>；{auth_note}）"
     )
     while not stop_event.is_set():
         server.handle_request()
@@ -482,8 +570,13 @@ def main():
     4. 啟動 MQTT 進線 thread。
     5. 依 NUM_DB_WRITERS 啟動對應數量的平行資料庫寫入 thread，把 10 台機台的 Queue
        平均分配給它們，其中第 0 條順便處理 MQTT 進線的資料（Phase2）。
-    6. 主執行緒進入 control_loop()，等待使用者輸入指令，直到收到 QUIT 或 Ctrl+C。
-    7. 結束時設定 stop_event，並確保 10 台機台的進程都真的被清乾淨（見迴圈內註解）。
+    6. 命令列介面 control_loop() 放到背景 thread；主執行緒只負責等 stop_event
+       （來源：stdin 的 QUIT、HTTP 的 POST /quit、Ctrl+C、docker stop 送來的 SIGTERM）。
+    7. 結束時先等寫入 thread 把手上的資料 flush 完，再確保 10 台機台的進程都真的被清乾淨。
+
+    注意：docker-compose.yml 設了 restart: unless-stopped，程式自己結束（包括 POST /quit）
+    之後 Docker 會把容器重新啟動，所以在 compose 底下 /quit 的效果等於「重啟」。
+    要真正停掉請用 docker compose stop edge_pipeline。
     """
     config = machine_config.load_config()
     stop_event = mp.Event()  # 唯一的全域停止旗標，所有進程/thread 都靠檢查這個來知道該收尾了
@@ -492,35 +585,66 @@ def main():
     for process in processes:
         process.start()
 
-    threading.Thread(target=process_monitor_loop, args=(processes, stop_event), daemon=True).start()
+    # SIGTERM（docker stop / compose down）改成走正常收尾流程。必須在 start() 機台進程之後才設，
+    # 子進程才不會繼承這個 handler（子進程由下面的 terminate() 負責收）。
+    # 另外 Python 在容器裡是 PID 1，PID 1 對「沒有自訂 handler」的 SIGTERM 會直接忽略，
+    # 不設的話 docker stop 只能等 10 秒逾時後 SIGKILL，緩衝裡的資料全部丟掉。
+    signal.signal(signal.SIGTERM, lambda signum, frame: stop_event.set())
+
+    writer_threads: list[threading.Thread] = []
+    threading.Thread(
+        target=process_monitor_loop,
+        args=(processes, stop_event),
+        kwargs={"writer_threads": writer_threads},  # 同一個 list，下面建好寫入 thread 後就會看得到
+        daemon=True,
+    ).start()
     threading.Thread(target=system_health_loop, args=(stop_event,), daemon=True).start()
     threading.Thread(
         target=http_control_loop, args=(danger_flags, degrade_flags, stop_event), daemon=True
     ).start()
 
-    mqtt_queue: "queue.Queue" = queue.Queue()  # 執行緒安全的一般 Queue（不是 multiprocessing.Queue），
-    # 因為 MQTT client 的 callback 是在同一個進程內的背景 thread 執行，不需要跨進程 IPC。
+    # 執行緒安全的一般 Queue（不是 multiprocessing.Queue），因為 MQTT client 的 callback
+    # 是在同一個進程內的背景 thread 執行，不需要跨進程 IPC。上限見 MQTT_QUEUE_MAXSIZE 的說明。
+    mqtt_queue: "queue.Queue" = queue.Queue(maxsize=MQTT_QUEUE_MAXSIZE)
     threading.Thread(
         target=run_mqtt_ingest,
         args=(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_TOPIC_PREFIX, mqtt_queue, stop_event),
+        kwargs={"username": MQTT_USERNAME, "password": MQTT_PASSWORD},
         daemon=True,
     ).start()
 
     for writer_id, partition in enumerate(partition_queues(queues, NUM_DB_WRITERS)):
         # 只有第 0 條寫入 thread 會拿到 mqtt_queue，負責順便處理 MQTT 進線；其餘傳 None。
         writer_mqtt_queue = mqtt_queue if writer_id == 0 else None
-        threading.Thread(
+        writer_thread = threading.Thread(
             target=db_writer_loop,
             args=(writer_id, partition, writer_mqtt_queue, stop_event),
+            name=f"db_writer-{writer_id}",
             daemon=True,
-        ).start()
+        )
+        writer_thread.start()
+        writer_threads.append(writer_thread)
+
+    # stdin 命令列介面放背景 thread（原因見 control_loop 的說明）。daemon=True：
+    # 它可能永遠卡在讀 stdin，不能讓它擋住程式結束。
+    threading.Thread(target=control_loop, args=(danger_flags, stop_event), daemon=True).start()
 
     try:
-        control_loop(danger_flags, stop_event)
+        # 用帶逾時的 wait 輪詢，而不是無限期 wait()：這樣 Ctrl+C 才能即時打斷主執行緒。
+        while not stop_event.wait(0.5):
+            pass
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
+        print("[main] 收到停止訊號，等待寫入 thread 把緩衝資料寫完...")
+        # 先讓寫入 thread 跑完它們 finally 裡的最後一次 flush，再處理機台進程。
+        # 資料庫正常時一次 flush 不到一秒；斷線中的話就放棄，不無限期卡住關機流程。
+        # 所有寫入 thread 共用一個總期限（不是每條各等 5 秒），整體要落在 docker stop 預設的
+        # 10 秒寬限期內，否則會被 SIGKILL 打斷。
+        join_deadline = time.time() + 5.0
+        for writer_thread in writer_threads:
+            writer_thread.join(timeout=max(0.0, join_deadline - time.time()))
         for process in processes:
             # 機台進程若還在等自己的 Queue 有空間（put() 被阻塞），
             # 一旦消費端（db_writer_loop）也因為 stop_event 停止抽乾 Queue，

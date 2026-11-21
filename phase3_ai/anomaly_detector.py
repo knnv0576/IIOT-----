@@ -1,12 +1,13 @@
 """One-Class SVM 頻譜異常偵測：每個通道各自訓練一個模型（只用正常運作時的資料），
 之後定期對最新窗口算特徵、餵進模型評分。
 
-跟 rul_predictor.py 的差異：RUL 抓的是「均值本身的線性趨勢」，這裡抓的是「這個窗口的
+跟 main.py 的電流 RUL 的差異：RUL 抓的是「均值本身的線性趨勢」，這裡抓的是「這個窗口的
 統計/頻譜特徵組合，跟訓練時看過的正常樣子差多少」——對早期、均值還看不出明顯偏移、
 但頻譜結構已經開始跑掉的異變更敏感。
+
+模型的存檔、載入與指紋（fingerprint）在 model_store.py，這裡只負責演算法本身。
 """
 
-import hashlib
 import os
 
 import numpy as np
@@ -116,24 +117,6 @@ def train_model(conn, device_id: str, sensor_id: str, fundamental_hz: float = FU
     return fit_model_from_features(feature_vectors, fundamental_hz)
 
 
-def model_fingerprint(model_bundle: dict) -> str:
-    """算出這個訓練好的模型的指紋，用來當 CUSUM 基線快取鍵的一部分。
-
-    為什麼需要（實測踩到的坑）：健康分數的分布是「機台 × **該次訓練出來的模型**」的屬性，
-    不是機台本身的屬性。原本 cusum_baselines 只用 (device_id, sensor_id) 當鍵，等於快取鍵不完整；
-    而 SVM 每次服務啟動都會重訓，取回的 mu0/sigma0 其實屬於另一個模型——實測 sigma0 被低估
-    1.5~3 倍，導致 slack 與門檻 h 一起縮水，健康通道的隨機遊走輕易跨過 h 而大量誤報。
-    把指紋納入鍵之後，模型不同就不會取到舊基線（自然退回現場暖機，正確行為）；
-    等日後模型本身也持久化了，指紋會相符，基線快取就會自動開始生效，不需要再改這裡。
-    """
-    model, scaler = model_bundle["model"], model_bundle["scaler"]
-    h = hashlib.sha256()
-    for arr in (model.dual_coef_, model.support_vectors_, np.atleast_1d(model.intercept_),
-                scaler.mean_, scaler.scale_):
-        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
-    return h.hexdigest()[:16]
-
-
 def score_latest_window(conn, device_id: str, sensor_id: str, model_bundle: dict):
     """對最新一個窗口的原始資料評分。回傳 (score, is_anomaly, features)，資料不足回傳 None。
     score 是 One-Class SVM 的 decision_function 值，越負代表跟訓練時看過的正常樣子差越多。
@@ -174,9 +157,17 @@ def score_latest_window(conn, device_id: str, sensor_id: str, model_bundle: dict
 # 關鍵性質：U_n 是嚴格的 iid 標準常態，**與未知的 μ、σ 無關**。所以：
 #   - 沒有參數估計誤差，門檻 h 從一開始就有它設計上的 ARL
 #   - 不需要暖機盲窗（第 3 筆就能開始判斷，實務上從第 5 筆起）
-#   - running 統計會跟著緩慢漂移走——真實機台的溫度/負載/磨耗漂移不會再累積成假警
 # 代價：早期樣本少時檢定力較弱；且若劣化在最初幾筆就已存在，會被當成「正常基準」吸收
 #（self-starting 的已知限制，無法避免）。
+#
+# **注意：這裡不會追蹤長期漂移。** running mean/SD 用 Welford 對「服務啟動以來的全部歷史」
+# 累計，第 n 筆對基準的影響只有 1/n。剛啟動時基準還會跟著資料移動；跑了幾百筆
+#（每筆 30 秒 → 幾小時）之後，基準幾乎就固定在這段期間的平均值。
+# 所以如果真實機台的分數因為季節溫度、負載或正常磨耗而緩慢漂移，漂移量大過 slack
+#（0.5σ）就會慢慢累積成告警——這時告警會是「真的偏離了啟動時的狀態」，但不一定代表故障。
+# 目前的處理方式是：重啟 ai_service（或重新 commissioning 訓練）就會重新建立基準。
+# 若要自動適應漂移，可以把 Welford 換成指數遺忘或固定長度滑動視窗，但那樣 U_n 就只是
+# 近似 N(0,1)、h 的 ARL 也要重新驗證（validation/ 的誤報重放），不能直接沿用 h=7。
 CUSUM_SLACK_K = 0.5  # 標準化後的 slack（單位是 σ）。CUSUM 只累積超過這個幅度的系統性下滑。
 
 # 決策門檻，單位是「標準化後的 σ」——因為 U_n 已經是 N(0,1)，h 是純數字，不再乘 sigma0。
@@ -207,7 +198,8 @@ class CusumTracker:
     """單一通道的 self-starting 單邊 CUSUM，偵測「異常分數持續往下掉」的漸進劣化。
 
     對外介面與舊版相同（update / calibrated / mu0 / sigma0 / value / h ...），
-    所以 main.py 不需要改動。內部改用 running 統計量 + t→常態轉換，不再有凍結的基線。
+    所以 main.py 不需要改動。內部改用 running 統計量 + t→常態轉換，不再有「暖機 20 筆就凍結」
+    的基線；基準會持續納入新觀測，但影響力隨樣本數遞減（見上方「不會追蹤長期漂移」的說明）。
     """
 
     def __init__(self) -> None:
@@ -314,6 +306,6 @@ class CusumTracker:
         if alarming:
             self._frozen = True
         elif self.value == 0.0 and self._frozen:
-            self._frozen = False  # 完全回復才解凍，重新讓基準跟著漂移
+            self._frozen = False  # 完全回復才解凍，基準重新開始納入新觀測
 
         return self.value, alarming

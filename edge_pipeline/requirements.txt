@@ -2,3 +2,5 @@ numpy
 psycopg2-binary
 paho-mqtt
 psutil
+# zoneinfo 的時區資料庫：python:3.11-slim 不保證有系統時區檔，mqtt_ingest 需要解析 Asia/Taipei
+tzdata

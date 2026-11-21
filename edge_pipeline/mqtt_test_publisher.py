@@ -12,10 +12,15 @@ import paho.mqtt.client as mqtt
 BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "mosquitto")
 BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
 TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "iiot")
+# mosquitto 禁止匿名連線，帳密沿用 edge_pipeline 容器的環境變數（來自 .env）
+USERNAME = os.environ.get("MQTT_USERNAME") or None
+PASSWORD = os.environ.get("MQTT_PASSWORD") or None
 
 
 def main():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    if USERNAME:
+        client.username_pw_set(USERNAME, PASSWORD)
     client.connect(BROKER_HOST, BROKER_PORT)
     client.loop_start()
 

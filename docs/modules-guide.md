@@ -49,11 +49,15 @@ validation（離線）：真實軸承資料 → 訓練 RF → 驗準度/泛化 �
 前景執行時也能用 stdin：`SCT-05 DANGER` / `SCT-05 NORMAL` / `STATUS` / `QUIT`。
 這是做每一次 AI 端到端驗證的入口。
 
+POST 類操作都要帶 `.env` 裡的 `CONTROL_API_TOKEN`（`GET /status` 免驗證）。
+API 預設只綁 127.0.0.1，要從別台機器操作，得在 `.env` 設 `CONTROL_API_BIND_ADDR=0.0.0.0`。
+
 範例：
 ```bash
-curl -X POST http://localhost:8080/degrade/SCT-05   # 開始漸進劣化
-curl http://localhost:8080/status                    # 查狀態
-curl -X POST http://localhost:8080/normal/SCT-05    # 解除
+TOKEN=<.env 裡的 CONTROL_API_TOKEN>
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/degrade/SCT-05   # 開始漸進劣化
+curl http://localhost:8080/status                                                    # 查狀態
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/normal/SCT-05    # 解除
 ```
 
 ### 場景 B：硬體隔離的多機台壓力測試
@@ -110,13 +114,15 @@ curl -X POST http://localhost:8080/normal/SCT-05    # 解除
 跨資料集驗證 **32/32 真實軸承全命中**（PHM2012 17 + XJTU-SY 15）。
 場景：在故障發生前數十分鐘就收到「這台開始劣化了」，安排停機保養。
 
-### 場景 C：剩餘壽命 RUL —— 三種視角
+### 場景 C：剩餘壽命 RUL —— 兩種視角
 
 | 種類 | 追蹤量 | 適用 | 函式 |
 |---|---|---|---|
 | 電流均值 RUL | 電流均值撞上下限 [5.5, 6.5]% | 負載漂移類故障 | `predict_rul` |
-| 振動頻譜 RUL | thd_ratio 撞 0.05 | 振幅還沒動、頻譜先變 | `predict_spectral_rul` |
 | **振動 ML RUL** | RF 模型輸出分鐘數 | 一般軸承磨損（正式服務採用） | `ml_vibration_rul` |
+
+> 早期還有一條「振動頻譜 RUL」（thd_ratio 線性外推撞 0.05），已被 ML RUL 取代，程式碼已移除。
+> 資料庫裡 `metric_kind='thd_ratio'` 的舊資料是那個時期留下的。
 
 ML RUL 用 `[rms_norm, kurt, crest, slope]` 四特徵餵 **32 顆真實軸承訓練的 RandomForest**
 （`models/rul_rf.pkl`），直接吐剩餘分鐘，自動分 STABLE / WARNING（<200 分）/ CRITICAL（<60 分）。

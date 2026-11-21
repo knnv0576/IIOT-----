@@ -1,9 +1,13 @@
 """Phase3 AI 推論服務：多層預測疊在一起。
 
-1. RUL（剩餘壽命）趨勢外推：觀察線性飄移速率，外推還要多久撞到門檻。兩種輸入：
-   (a) 電流均值 → 撞電流上下限；(b) 振動 thd_ratio（諧波比值）→ 撞頻譜劣化門檻。
-   為什麼振動用 thd_ratio 而非振幅：SCT-05 實驗證實漸進劣化時振動「振幅」幾乎不動
-   （std +4%）、但 thd_ratio 大幅上升（×20），所以追蹤頻譜訊號才能提前預測、追蹤振幅會太晚。
+1. RUL（剩餘壽命）預測，兩條路徑：
+   (a) 電流 RUL：對電流均值做滑動視窗線性回歸，外推還要多久撞到電流上下限
+       （metric_kind='current_mean'）。
+   (b) 振動 RUL：RandomForest 模型（models/rul_rf.pkl，32 顆真實軸承訓練）從時域特徵
+       [rms_norm, kurt, crest, rms 斜率] 直接預測剩餘分鐘，附 P10/P90 信賴區間
+       （metric_kind='ml_rf'）。早期版本用 thd_ratio 線性外推（含「CUSUM onset 後才 fit」
+       的兩段式改良），已被 ML RUL 取代並移除；DB 裡 metric_kind='thd_ratio' 的舊資料
+       是那個時期留下的。
 2. 頻譜異常評分（One-Class SVM）：對每個通道訓練一個「正常樣子長怎樣」的模型，
    定期對最新一段原始波形算時域+頻域特徵去評分，能抓到均值還看不出來、但頻譜結構
    已經開始跑掉的早期異變（實作見 anomaly_detector.py / spectral_features.py）。
@@ -11,10 +15,8 @@
    振動頻譜裡更早顯現，這也是公開 PHM 資料集清一色是振動的原因。
 3. 線上 CUSUM 漸進劣化偵測：對每個通道的異常分數時序做單邊累積，抓「分數持續系統性
    下滑」而非「低於某條線」。跨資料集驗證過（PHM2012 17/17 + XJTU-SY 15/15 = 32/32 全命中）。
-
-振動 RUL 是「兩段式」：CUSUM 警報當階段1「偵測 onset」（劣化確實開始了），onset 後才進
-階段2「預測」——只用 onset 之後的 thd 資料 fit 斜率外推撞門檻。這樣斜率不會被健康期平線
-污染，修掉單段式固定視窗早期 ETA 高估的毛病。onset 前一律 STABLE、不亂預測。
+4. 振動時域跳線（災難兜底）：三軸 RMS 合成幅值超過 ISO 危險線就強制 CRITICAL 並閂鎖，
+   獨立執行緒、獨立連線，不受 SVM/ML 路徑影響（metric_kind='vib_trip'）。
 
 跟 Phase1 的「危險模式」（瞬間切換的 0/1 開關）不同，這裡抓的是漸進式趨勢；
 如果資料本身很穩定，各層結果都應該顯示正常，這是正確行為，不是没抓到東西。
@@ -92,22 +94,6 @@ VIB_TRIP_DEBOUNCE_CYCLES = int(os.environ.get("VIB_TRIP_DEBOUNCE_CYCLES", "3")) 
 # 重置遲滯（ISA-18.2 防抖動）：跳閘後要掉到「門檻 × 此比例」以下才算條件解除，
 # 否則在門檻邊緣徘徊會 trip/clear 反覆跳。
 VIB_TRIP_RESET_RATIO = float(os.environ.get("VIB_TRIP_RESET_RATIO", "0.9"))
-
-# 頻譜訊號版振動 RUL：不追蹤振動「振幅」（SCT-05 實驗證實振幅在頻譜劣化時幾乎不動），
-# 改追蹤 thd_ratio（諧波/基頻能量比）的上升趨勢——它在劣化早期就穩定爬升。做法跟電流 RUL
-# 同架構（滑動視窗線性回歸 + 外推撞門檻），只是輸入換成 anomaly_scores 表累積的 thd_ratio 時序。
-SPECTRAL_RUL_WINDOW_SECONDS = float(os.environ.get("SPECTRAL_RUL_WINDOW_SECONDS", "900"))  # thd 回歸視窗（anomaly_scores 每 30s 一筆，900s≈30 點）
-SPECTRAL_MIN_POINTS = 10  # thd 序列至少這麼多點才回歸
-SPECTRAL_MIN_R_SQUARED = float(os.environ.get("SPECTRAL_MIN_R_SQUARED", "0.3"))  # 趨勢顯著性門檻
-VIBRATION_THD_DANGER = float(os.environ.get("VIBRATION_THD_DANGER", "0.05"))  # thd 劣化門檻：健康約0.005，SCT-05全劣化達0.10，取0.05當危險線
-
-# 兩段式 RUL：CUSUM 警報當「偵測 onset」，onset 後只用劣化段資料 fit 斜率。
-# 動機（SCT-05 實驗教訓）：單段式固定 900s 視窗會把「健康期平線」混進 fit，斜率被拉平、
-# 早期 ETA 高估（曾一開始估 5.4 小時才慢慢收斂）。錨到 onset、只 fit 劣化段 → 斜率乾淨、ETA 早就準。
-SPECTRAL_RUL_MAX_WINDOW = float(os.environ.get("SPECTRAL_RUL_MAX_WINDOW", "1800"))  # onset 後最多回看這麼久的 thd（避免視窗無限長、斜率變太平均）
-# onset 安全網：光靠 CUSUM(score) 當閘門太脆弱——實測 V05-X 的 CUSUM 沒觸發，害 RUL 卡在 STABLE
-# 即使 thd 已飆到 0.099。所以再加一條：thd 本身升破這個 floor（約健康基線 0.005 的 3 倍）也算 onset。
-THD_ONSET_FLOOR = float(os.environ.get("THD_ONSET_FLOOR", "0.015"))
 
 RECONNECT_COOLDOWN = 2.0
 
@@ -191,46 +177,12 @@ def predict_rul(slope: float, r_squared: float, current_mean: float):
     return target, eta_seconds, status
 
 
-def fetch_thd_series(conn, device_id: str, sensor_id: str, window_seconds: float) -> list[tuple[float, float]]:
-    """從 anomaly_scores 撈最近 window_seconds 秒的 (時間, thd_ratio) 序列，給頻譜 RUL 做趨勢外推。"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT extract(epoch FROM ts) AS t, thd_ratio
-            FROM anomaly_scores
-            WHERE device_id = %s AND sensor_id = %s AND thd_ratio IS NOT NULL
-              AND ts > now() - (%s * interval '1 second')
-            ORDER BY ts
-            """,
-            (device_id, sensor_id, window_seconds),
-        )
-        return cur.fetchall()
-
-
-def predict_spectral_rul(slope: float, r_squared: float, recent_thd: float):
-    """回傳 (目標門檻, 預估還要幾秒撞到, 狀態)。thd_ratio 只會因劣化而「上升」，
-    所以只看正斜率；趨勢不顯著或沒在上升就判 STABLE。"""
-    if r_squared < SPECTRAL_MIN_R_SQUARED or slope <= 1e-9:
-        return None, None, "STABLE"
-    target = VIBRATION_THD_DANGER
-    if recent_thd >= target:
-        return target, 0.0, "CRITICAL"
-    eta_seconds = (target - recent_thd) / slope
-    if eta_seconds < 300:
-        status = "CRITICAL"
-    elif eta_seconds < 1800:
-        status = "WARNING"
-    else:
-        status = "STABLE"
-    return target, eta_seconds, status
-
-
 def insert_prediction(
     conn, device_id, sensor_id, value, slope, r_squared, target, eta_seconds, status,
     metric_kind: str = "current_mean", eta_p10_seconds=None, eta_p90_seconds=None,
 ) -> None:
-    """metric_kind：被追蹤的量——電流 RUL 是 'current_mean'（電流均值），
-    振動頻譜 RUL 是 'thd_ratio'（諧波比值）。value 欄位存的就是該量的目前值。
+    """metric_kind：哪一種預測——'current_mean'（電流均值 RUL）、'ml_rf'（振動 ML RUL，
+    value 存 rms_norm）、'vib_trip'（時域跳線，value 存三軸合成 RMS）。value 欄位存的就是該量的目前值。
     eta_p10/p90：ISO 13381-1 要求的信賴區間（目前只有 ML RUL 有，其餘傳 None）。"""
     with conn.cursor() as cur:
         cur.execute(
@@ -327,8 +279,6 @@ _anomaly_models: dict[tuple[str, str], dict] = {}
 _cusum_trackers: dict[tuple[str, str], CusumTracker] = {}
 # {(device_id, sensor_id): 模型指紋}；CUSUM 基線的存取都要帶這個，確保基線與模型是同一組。
 _model_fingerprints: dict[tuple[str, str], str] = {}
-# {(device_id, sensor_id): onset_epoch}；CUSUM 首次警報的時刻，兩段式 RUL 用它當劣化起點錨。
-_rul_onset: dict[tuple[str, str], float] = {}
 # {(device_id, sensor_id): 已記錄的 calib_generation}；每完成一次校準才記/存一次（含重新校準）。
 _cusum_calib_gen: dict[tuple[str, str], int] = {}
 # {(device_id, sensor_id): 健康基線 rms}；ML RUL 的 rms_norm=現值/基線，用最早幾筆健康 rms 算一次。
@@ -632,7 +582,7 @@ def run_anomaly_detection_cycle(conn) -> None:
             # 每完成一次校準（含重新校準）記/存一次：載入的印提示、現場暖機的存進 DB 供下次免暖機。
             if tracker.calibrated and _cusum_calib_gen.get(key) != tracker.calib_generation:
                 _cusum_calib_gen[key] = tracker.calib_generation
-                if tracker.source == "loaded":
+                if tracker.source == "seeded":  # CusumTracker.load_baseline() 載入時設的值
                     print(
                         f"[ai_service] CUSUM 基線已載回（跳過暖機、再驗證中）: {device_id}/{sensor_id} "
                         f"mu0={tracker.mu0:.3f} sigma0={tracker.sigma0:.3f}"
@@ -647,14 +597,10 @@ def run_anomaly_detection_cycle(conn) -> None:
                     # 乾淨校準才存，並綁定當前模型指紋
                     save_cusum_baseline(conn, device_id, sensor_id, tracker, _model_fingerprints[key])
                     print(
-                        f"[ai_service] CUSUM 基線已存檔（下次重啟免暖機）: {device_id}/{sensor_id} "
+                        f"[ai_service] CUSUM 基線已存檔（CUSUM_USE_PERSISTED_BASELINE=1 時下次啟動會載入）: "
+                        f"{device_id}/{sensor_id} "
                         f"mu0={tracker.mu0:.3f} sigma0={tracker.sigma0:.3f}"
                     )
-
-            # 兩段式 RUL 的階段1：CUSUM 首次警報 = 劣化 onset，記下時刻當趨勢 fit 的起點錨。
-            if is_degrading and key not in _rul_onset:
-                _rul_onset[key] = time.time()
-                print(f"[ai_service] 劣化 onset 標記: {device_id}/{sensor_id}（RUL 進入階段2，開始倒數）")
 
             if is_anomaly:
                 print(
@@ -685,7 +631,7 @@ def main() -> None:
     print(
         f"[ai_service] 頻譜異常評分啟動：每 {ANOMALY_CHECK_INTERVAL:.0f}s 一輪、每個特徵窗口 {WINDOW_SAMPLES} 筆，"
         f"涵蓋電流({CURRENT_FUNDAMENTAL_HZ:.0f}Hz) + 振動({VIBRATION_FUNDAMENTAL_HZ:.0f}Hz) 共 6 通道/台，"
-        f"含線上 CUSUM 漸進劣化偵測（robust 校準 + 基線持久化，重啟免暖機）"
+        f"含線上 self-starting CUSUM 漸進劣化偵測（前 {CUSUM_WARMUP_SAMPLES} 筆只累積基準、不判斷）"
     )
 
     print(
@@ -745,7 +691,8 @@ def main() -> None:
                     if result is None:
                         continue  # 模型未載入或資料不足（含健康基線還沒建好），下一輪再說
                     rul_min, p10_min, p90_min, rms_norm, slope = result
-                    # 判定基準：預設用 P10（悲觀界），抵銷模型末期高估 RUL 的已知失效模式。
+                    # 判定基準：預設用點估計（ML_RUL_STATUS_QUANTILE="mean"）；設成 "p10" 才改用
+                    # 悲觀界來抵銷模型末期高估 RUL 的已知失效模式（切換時要一併調門檻，見常數說明）。
                     basis = p10_min if (ML_RUL_STATUS_QUANTILE == "p10" and p10_min is not None) else rul_min
                     if basis < ML_RUL_CRITICAL_MIN:
                         status = "CRITICAL"

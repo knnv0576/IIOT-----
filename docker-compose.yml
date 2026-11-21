@@ -1,5 +1,15 @@
 name: iiot
 
+# ── 安全設定 ──────────────────────────────────────────────────────────────
+# 所有密碼與 token 都**沒有預設值**，必須寫在專案根目錄的 .env（範本：.env.example）。
+# 沒設定的話 docker compose 會直接報錯、拒絕啟動，不會用弱密碼偷偷跑起來。
+#
+# 對外開放的埠：
+# - 1883 MQTT：給外部裝置進線，對所有網卡開放，但必須帳密認證（見 mosquitto 服務）。
+# - 3000 Grafana：給人看儀表板，對所有網卡開放，登入密碼由 GRAFANA_ADMIN_PASSWORD 決定。
+# - 5432 TimescaleDB、8080 控制 API：預設只綁 127.0.0.1（只有本機連得到）。
+#   其他服務是走 Docker 內部網路連線，不受這個限制影響。真的需要從別台機器連，
+#   再到 .env 設定 DB_BIND_ADDR / CONTROL_API_BIND_ADDR=0.0.0.0。
 services:
   # Phase 1 + Phase 2：機台模擬（10 個 multiprocessing.Process）與 TimescaleDB 寫入
   # 這兩個 Phase 放在同一個容器/同一個 Python 進程樹裡，
@@ -14,21 +24,41 @@ services:
       - timescaledb
       - mosquitto
     environment:
-      TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:-iiot_password}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
+      TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:?請在 .env 設定 TIMESCALEDB_PASSWORD（範本見 .env.example）}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
       MQTT_BROKER_HOST: mosquitto
       MQTT_BROKER_PORT: "1883"
       MQTT_TOPIC_PREFIX: iiot
+      MQTT_USERNAME: ${MQTT_USERNAME:-iiot}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?請在 .env 設定 MQTT_PASSWORD（範本見 .env.example）}
+      # 字串時間戳沒帶時區時，當成哪個時區的時間（IANA 名稱）
+      MQTT_NAIVE_TIMESTAMP_TZ: ${MQTT_NAIVE_TIMESTAMP_TZ:-Asia/Taipei}
       NUM_DB_WRITERS: ${NUM_DB_WRITERS:-4}
       HTTP_CONTROL_PORT: "8080"
+      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN:?請在 .env 設定 CONTROL_API_TOKEN（範本見 .env.example）}
     ports:
-      - "8080:8080"  # 危險模式控制 API：GET /status、POST /danger/<device>、POST /normal/<device>
-    stdin_open: true  # 保持 stdin 開啟，讓 control_loop 在 -d（背景）模式下不會因為 stdin 立刻 EOF 而馬上結束
+      # 危險模式控制 API：GET /status 免驗證；POST /danger|degrade|normal/<device>、/quit
+      # 必須帶 Authorization: Bearer <CONTROL_API_TOKEN>
+      - "${CONTROL_API_BIND_ADDR:-127.0.0.1}:8080:8080"
+    # 保持 stdin 開啟，`docker attach iiot-edge-pipeline` 才能用命令列介面（SCT-05 DANGER 等）。
+    # 不開也沒關係：stdin EOF 只會讓命令列介面停用，系統照常運作（HTTP API 不受影響）。
+    stdin_open: true
     restart: unless-stopped
 
   # 外部 IoT 資料進線用的 MQTT broker（之後真實裝置或其他協定轉接器都可以往這裡發布）
   mosquitto:
     image: eclipse-mosquitto:latest
     container_name: iiot-mosquitto
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-iiot}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?請在 .env 設定 MQTT_PASSWORD（範本見 .env.example）}
+    # 每次啟動都用 .env 的帳密重新產生密碼檔，改 .env 之後重啟 mosquitto 就會生效。
+    # 密碼檔的擁有者必須是 mosquitto、權限 0700，否則 mosquitto 會警告（新版會拒絕讀取）。
+    # 「$$」是 compose 的跳脫寫法，讓變數留到容器裡的 sh 才展開，不會被 compose 先吃掉。
+    command: >
+      sh -c 'mosquitto_passwd -b -c /mosquitto/data/passwd "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
+      && chown mosquitto:mosquitto /mosquitto/data/passwd
+      && chmod 0700 /mosquitto/data/passwd
+      && exec mosquitto -c /mosquitto/config/mosquitto.conf'
     ports:
       - "1883:1883"
     volumes:
@@ -36,15 +66,17 @@ services:
     restart: unless-stopped
 
   # Phase 2 儲存層：PostgreSQL + TimescaleDB 擴充套件
+  # 注意：POSTGRES_PASSWORD 只在資料卷「第一次初始化」時生效。已經有資料卷的話，
+  # 改 .env 不會改到資料庫裡的密碼，要另外執行 ALTER USER（見 .env.example 的說明）。
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     container_name: iiot-timescaledb
     environment:
       POSTGRES_USER: ${TIMESCALEDB_USER:-iiot}
-      POSTGRES_PASSWORD: ${TIMESCALEDB_PASSWORD:-iiot_password}
+      POSTGRES_PASSWORD: ${TIMESCALEDB_PASSWORD:?請在 .env 設定 TIMESCALEDB_PASSWORD（範本見 .env.example）}
       POSTGRES_DB: ${TIMESCALEDB_DB:-iiot}
     ports:
-      - "5432:5432"
+      - "${DB_BIND_ADDR:-127.0.0.1}:5432:5432"
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
       - ./timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -58,7 +90,7 @@ services:
     depends_on:
       - timescaledb
     environment:
-      TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:-iiot_password}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
+      TIMESCALEDB_DSN: postgresql://${TIMESCALEDB_USER:-iiot}:${TIMESCALEDB_PASSWORD:?請在 .env 設定 TIMESCALEDB_PASSWORD（範本見 .env.example）}@timescaledb:5432/${TIMESCALEDB_DB:-iiot}
       MODEL_STORE_DIR: /app/model_store
     volumes:
       # 訓練好的頻譜異常模型（每通道一個 SVM）。放 volume 才能跨容器重建保留——
@@ -68,6 +100,8 @@ services:
     restart: unless-stopped
 
   # Phase 4：Grafana 視覺化戰情室
+  # 注意：GF_SECURITY_ADMIN_PASSWORD 只在 grafana_data 資料卷「第一次初始化」時生效。
+  # 已經有資料卷的話，要用 grafana cli 重設（見 .env.example 的說明）。
   grafana:
     image: grafana/grafana:latest
     container_name: iiot-grafana
@@ -76,9 +110,9 @@ services:
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?請在 .env 設定 GRAFANA_ADMIN_PASSWORD（範本見 .env.example）}
       TIMESCALEDB_USER: ${TIMESCALEDB_USER:-iiot}
-      TIMESCALEDB_PASSWORD: ${TIMESCALEDB_PASSWORD:-iiot_password}
+      TIMESCALEDB_PASSWORD: ${TIMESCALEDB_PASSWORD:?請在 .env 設定 TIMESCALEDB_PASSWORD（範本見 .env.example）}
       TIMESCALEDB_DB: ${TIMESCALEDB_DB:-iiot}
     volumes:
       - grafana_data:/var/lib/grafana

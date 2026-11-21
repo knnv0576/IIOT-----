@@ -1,6 +1,10 @@
-"""每日異常擷取：在 30 天保留政策把舊的原始 chunk 丟掉之前，
+"""每日異常擷取：在保留政策把舊的原始 chunk 丟掉之前，
 把超過「可接受」門檻（警示 C + 危險 D 都算異常）的原始資料另外存進 sensor_anomalies，
 其餘正常資料則交給 TimescaleDB 原生的 Continuous Aggregate（sensor_daily_summary）做每日平均壓縮。
+
+前提：原始資料保留期要超過 1 天，這支程式處理「昨天」時資料才還在。本機開發環境只保留
+20 分鐘（見 timescaledb/init.sql），所以在本機跑會擷取到 0 筆，這是預期中的結果。
+另外這支程式目前沒有被任何排程呼叫，部署時要自己用 cron 之類的工具每天跑一次。
 
 異常判斷門檻直接沿用 machine_config.py，不在 SQL 端另外存一份門檻常數，
 避免以後改了 Excel/machine_config.py 的門檻卻忘記同步改 SQL。

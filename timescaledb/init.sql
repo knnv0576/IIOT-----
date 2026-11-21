@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS sensor_readings (
 -- chunk 間隔 10 分鐘：預設 7 天對高頻寫入來說太大。原本設 1 小時，但實測全速下
 -- 單一未壓縮 chunk 會膨脹到上百 GB（壓縮政策只處理「已關閉」的 chunk，正在寫入的
 -- 當前 chunk 完全不受控），直接把磁碟撐爆；縮到 10 分鐘讓當前 chunk 的峰值可控
---（4kHz、24 萬筆/秒下約 22GB），也讓容量保險絲能更快介入。
+--（當年 4kHz、24 萬筆/秒實測約 22GB；現在 2kHz、12 萬筆/秒，推估約一半），
+-- 也讓容量保險絲能更快介入。
 SELECT create_hypertable(
     'sensor_readings', 'ts',
     chunk_time_interval => INTERVAL '10 minutes',
@@ -21,10 +22,13 @@ CREATE INDEX IF NOT EXISTS idx_sensor_readings_device_sensor_ts
     ON sensor_readings (device_id, sensor_id, ts DESC);
 
 -- 原始資料保留 20 分鐘、每 5 分鐘檢查一次（drop_chunks 整塊丟棄，幾乎零成本）。
--- 為什麼這麼短：資料庫實體磁碟現在放 F: 槽（Crucial T500 NVMe，~930GB），4kHz 全速寫入
--- 約 130GB/小時，20 分鐘保留讓原始資料的磁碟佔用穩定在 ~45GB。下游都不需要更長的原始資料：
--- AI 頻譜異常偵測只要最近 400 秒、Grafana 電流/振動面板查的是 1 秒彙總（見下方 CAgg）、
--- 長期趨勢由彙總視圖保存（獨立儲存，不受本保留政策影響）。若想留更長歷史，F: 空間充裕可拉長。
+-- 為什麼這麼短：這是**本機開發環境**的設定，本機磁碟撐不住全速寫入（當年 4kHz 實測約
+-- 130GB/小時、20 分鐘保留約 45GB；現在 2kHz 推估約一半）。正式環境預計部署在公司伺服器，
+-- 屆時應依磁碟容量拉長。注意兩個下游功能要求原始資料保留期夠長才會有資料：
+--   - sensor_daily_summary（下方）的刷新窗是「3 天前～1 天前」→ 保留期要超過 3 天。
+--   - edge_pipeline/anomaly_extractor.py 處理「昨天」整天 → 保留期要超過 1 天，且要另外排程執行。
+-- 其他下游不需要更長的原始資料：AI 頻譜異常偵測只要最近 300 秒、Grafana 電流/振動面板
+-- 查的是 1 秒彙總（見下方 CAgg）。
 -- 註：原本配有 TimescaleDB 原生壓縮（實測 17 倍），但資料只活 20 分鐘根本輪不到壓縮（15 分才壓、
 -- 20 分就丟），且壓縮 job 的 I/O 尖峰會跟串流寫入互搶，故整組移除。若日後拉長保留期，可恢復
 -- 壓縮設定（git 歷史有完整範例）。
@@ -32,8 +36,9 @@ SELECT add_retention_policy('sensor_readings',
     drop_after => INTERVAL '20 minutes',
     schedule_interval => INTERVAL '5 minutes');
 
--- 每日摘要（Downsampling）：正常資料的長期保存形式，TimescaleDB 原生 Continuous Aggregate，
--- 不受 30 天保留政策限制（這是獨立的物化視圖，raw chunk 被丟掉後摘要仍然保留）。
+-- 每日摘要（Downsampling）：正常資料的長期保存形式，TimescaleDB 原生 Continuous Aggregate。
+-- 這是獨立的物化視圖，已經算進摘要的部分在 raw chunk 被丟掉後仍然保留；但前提是刷新時
+-- 原始資料還在——原始資料保留期短於 3 天（例如本機的 20 分鐘）時，這張表會一直是空的。
 CREATE MATERIALIZED VIEW IF NOT EXISTS sensor_daily_summary
 WITH (timescaledb.continuous) AS
 SELECT
@@ -104,8 +109,9 @@ CREATE TABLE IF NOT EXISTS system_health (
 
 SELECT create_hypertable('system_health', 'ts', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
 
--- Phase4 儀表板用：電流/振動是 4kHz 原始資料，Grafana 面板如果直接查 sensor_readings 原始表，
--- 5 分鐘視窗就要掃幾百萬筆，實測要 5~12 秒、超過 Grafana 預設的查詢逾時，面板會一直轉圈圈。
+-- Phase4 儀表板用：電流/振動是 2kHz 原始資料，Grafana 面板如果直接查 sensor_readings 原始表，
+-- 5 分鐘視窗就要掃幾百萬筆，實測（4kHz 時期）要 5~12 秒、超過 Grafana 預設的查詢逾時，
+-- 面板會一直轉圈圈。
 -- 改成 Continuous Aggregate 讓 TimescaleDB 背景先算好 1 秒一筆的彙總，面板改查這裡，
 -- 實測從 5~12 秒降到 0.05 秒。TimescaleDB 預設支援 real-time aggregate（最新幾秒的資料
 -- 會即時併入查詢結果），所以不會因為背景彙總的排程間隔而看起來延遲。
@@ -247,8 +253,9 @@ CREATE TABLE IF NOT EXISTS cusum_baselines (
 -- 查詢時因為 NULL 不等於任何值而自然不會命中 → 舊基線自動失效、重新暖機，正是我們要的。
 ALTER TABLE cusum_baselines ADD COLUMN IF NOT EXISTS model_fingerprint TEXT;
 
--- 容量保險絲：TimescaleDB 的保留政策只支援「按時間」，但以每秒十幾萬筆的持續寫入，
--- 30 天時間保留根本來不及擋（實測 4kHz 全速跑 9 小時就累積 81GB、曾把系統碟撐爆）。
+-- 容量保險絲：TimescaleDB 的保留政策只支援「按時間」，以每秒十幾萬筆的持續寫入，
+-- 時間保留設長一點就擋不住（當年保留期設 30 天時，4kHz 全速跑 9 小時就累積 81GB、
+-- 曾把系統碟撐爆）。保留政策若因故沒在執行，這也是最後一道防線。
 -- 這個自訂排程工作每 5 分鐘檢查 sensor_readings 的實際大小，超過 limit_gb
 -- 就丟棄所有已封存的 chunk 重新累計——drop_chunks(older_than => now()) 不會動到
 -- 「正在寫入的當前 chunk」（其時間範圍上界在未來），所以寫入完全不中斷；
@@ -268,8 +275,8 @@ BEGIN
 END
 $BODY$;
 
--- 上限 150GB：這是「時間保留政策失效時」的第二道防線（正常情況下 20 分鐘保留政策會把
--- 大小壓在 ~45GB，摸不到這條線）。資料庫實體位置在 F: 槽（Crucial T500 NVMe，~930GB），
--- 4kHz 下 20 分保留約 45GB，留大量餘裕故上限設 150GB。用 alter_job(<job_id>, config => ...) 可調。
+-- 上限 150GB：這是「時間保留政策失效時」的第二道防線（本機 20 分鐘保留下，2kHz 推估約
+-- 20 多 GB，摸不到這條線）。部署到公司伺服器、拉長保留期時，要依實際磁碟容量一併調整。
+-- 用 alter_job(<job_id>, config => ...) 可調。
 SELECT add_job('purge_sensor_readings_when_oversize', INTERVAL '5 minutes',
                config => '{"limit_gb": 150}');

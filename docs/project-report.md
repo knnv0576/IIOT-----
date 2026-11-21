@@ -118,6 +118,9 @@ Python GIL，讓 8 核 CPU 能真正平行產生資料。
 | `POST /normal/<機台>` | 解除 | — |
 | `GET /status` | 查全機隊狀態 | — |
 
+POST 類端點都要帶 `Authorization: Bearer <CONTROL_API_TOKEN>`（`GET /status` 免驗證）；
+API 預設只綁 127.0.0.1。
+
 **漸進劣化的設計演進**：原本只注入頻譜諧波（振幅幾乎不變），刻意讓「只看均值」看不出來、
 只有頻譜分析抓得到。後來接上 ML RUL 時發現模型 57% 靠振幅（`rms_norm`），完全抓不到 ——
 因為真實軸承磨損 RMS 會暴增。故補上 `DEGRADE_VIBRATION_AMPLITUDE_GROWTH`，讓劣化同時觸發
@@ -171,6 +174,12 @@ Python GIL，讓 8 核 CPU 能真正平行產生資料。
 
 MQTT（port 1883）訂閱 `iiot/#`，主題格式 `iiot/<device_id>/<sensor_id>`，
 payload 為 JSON。真實裝置與模擬器寫進**同一張表**，所以下游全部不用改。
+
+- **認證**：broker 禁止匿名連線，帳密是 `.env` 的 `MQTT_USERNAME` / `MQTT_PASSWORD`。
+- **輸入驗證**：device_id／sensor_id 只收英數字與 `_ . : -`；value 必須是有限數字；
+  時間戳最多只能比現在晚 5 分鐘。不合格的訊息會被丟棄並印 log。
+- **時間戳時區**：建議送帶時區的 ISO 8601（例如 `2026-07-01T19:23:45.125+08:00`）。
+  沒帶時區的字串一律當成 `MQTT_NAIVE_TIMESTAMP_TZ`（預設 `Asia/Taipei`）。
 
 ---
 
@@ -490,18 +499,25 @@ CUSUM 地板一度訂 5σ，理由是「單通道 ARL 938，還算安靜」。**
 
 ### 🔴 安全（上線前必修）
 
+已修（2026-11）：
+
+| 原本的問題 | 現在的做法 |
+|---|---|
+| 控制 API 無認證且對外 | POST 需 Bearer token（`CONTROL_API_TOKEN`）；預設只綁 127.0.0.1 |
+| 全部使用預設密碼 | compose 不再提供預設密碼，`.env` 沒設定就拒絕啟動（範本：`.env.example`） |
+| 5432 對外映射 | 預設只綁 127.0.0.1 |
+| MQTT 匿名可寫、無輸入驗證 | 禁止匿名、需帳密；ID／數值／時間戳都會驗證，未來時間戳最多允許 5 分鐘 |
+| MQTT 佇列無上限 | 上限 10 萬筆，滿了就丟新訊息並限頻印 log |
+
+仍待處理：
+
 | 問題 | 風險 |
 |---|---|
-| **控制 API 無認證且對外** | 任何人可 `POST /quit` 停掉整條資料擷取 |
-| **全部使用預設密碼**（`.env` 不存在） | DB `iiot/iiot_password`、Grafana `admin/admin` |
-| **5432 對外映射** | 預設密碼 + DB owner 帳號 → 可讀寫/DROP 全部資料 |
-| **MQTT 匿名可寫、無輸入驗證** | 資料汙染；**未來時間戳可繞過保留政策把磁碟撐爆** |
-| MQTT 佇列無上限 | 記憶體耗盡 DoS |
 | 容器以 root 執行 | 攻破後風險放大 |
 | Grafana 用 DB owner 帳號 | 登入即可執行任意 SQL |
+| 既有資料卷沿用舊密碼 | 密碼只在資料卷第一次建立時生效，舊環境要手動改（見 `.env.example`） |
 
 > 專案本身**沒有注入類漏洞**（SQL 全部參數化、無 `eval`/`exec`、MQTT 用 `json` 而非 `pickle`）。
-> 風險集中在「沒有認證 + 預設密碼 + 全埠對外」。
 
 ### 🟠 接真實感測器前必做
 
@@ -540,10 +556,10 @@ CUSUM 地板一度訂 5σ，理由是「單通道 ARL 938，還算安靜」。**
 docker compose up -d
 docker compose stop --timeout 90        # 務必給足時間讓 DB checkpoint
 
-# 故障注入
-curl -X POST http://localhost:8080/degrade/SCT-05   # 漸進劣化
-curl -X POST http://localhost:8080/danger/SCT-05    # 瞬間故障
-curl -X POST http://localhost:8080/normal/SCT-05    # 解除
+# 故障注入（TOKEN = .env 裡的 CONTROL_API_TOKEN）
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/degrade/SCT-05   # 漸進劣化
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/danger/SCT-05    # 瞬間故障
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/normal/SCT-05    # 解除
 curl http://localhost:8080/status
 
 # 模型管理
@@ -555,7 +571,7 @@ docker compose exec ai_service python trainer.py --all --force --save-features /
 python tools/export_baseline_snapshot.py --minutes 5 --note "commissioning，全機台目視正常"
 
 # 戰情室
-http://localhost:3000       # admin/admin
+http://localhost:3000       # 帳號 admin，密碼 = .env 的 GRAFANA_ADMIN_PASSWORD
 ```
 
 ## 附錄：相關文件
